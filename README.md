@@ -229,9 +229,24 @@ disconnected and are not replayed.
 
 ## Publishing releases (maintainers)
 
-The distributed Docker image is built **locally** and pushed to GHCR — CI only
-runs `fmt`/`clippy`/`test`, it does not build or publish the image. To cut a
-release:
+There are two ways to publish; both produce the same multi-arch image on GHCR
+and users pick it up with `docker compose pull`.
+
+### Option A — automated on tag (recommended)
+
+Pushing a semver tag triggers `.github/workflows/release.yml`, which builds
+`linux/amd64` + `linux/arm64`, pushes `:X.Y.Z` and `:latest` to GHCR, and
+creates the matching GitHub Release. It uses the built-in `GITHUB_TOKEN`, so no
+secrets to configure:
+
+```bash
+make release V=0.1.1      # bump Cargo.toml version, commit, and tag v0.1.1
+git push --follow-tags    # push the commit + tag; the workflow does the rest
+```
+
+### Option B — build and push locally
+
+Useful when you want to publish without going through CI:
 
 1. Bump `version` in `Cargo.toml` (this is the image tag) and commit.
 2. Log in once with a GitHub Personal Access Token that has the `write:packages`
@@ -242,20 +257,20 @@ release:
    make docker-login
    ```
 
-3. Build the multi-arch image (`linux/amd64` + `linux/arm64`) and push both the
-   version tag and `latest`:
+3. Build the multi-arch image and push both the version tag and `latest`:
 
    ```bash
    make publish
    ```
 
-Users then pick it up with `docker compose pull`. Run `make help` to see all
-targets; `make docker-build` produces a single-arch image locally without
-pushing (handy for testing or building from source).
+Run `make help` to see all targets; `make docker-build` produces a single-arch
+image locally without pushing (handy for testing or building from source).
 
-> The first push creates the `anony-mail` package under your GitHub account. Set
-> its visibility to **Public** in the package settings so users can pull without
-> authenticating.
+> On the very first publish, GitHub creates the `anony-mail` package as
+> **private**. Set its visibility to **Public** in the package settings so users
+> can pull without authenticating. CI-published images auto-link to this repo;
+> locally published ones link once the image carries the
+> `org.opencontainers.image.source` label (already set in the `Dockerfile`).
 
 ## Testing
 
