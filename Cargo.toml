@@ -1,5 +1,5 @@
 [package]
-name = "tempmail-backend"
+name = "anony-mail"
 version = "0.1.0"
 edition = "2024"
 description = "Inbound-only disposable email (temp mail) backend: receives mail over SMTP and serves it via a REST + SSE API."

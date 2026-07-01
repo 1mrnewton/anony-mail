@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for your interest in improving tempmail-backend! Contributions of all
+Thanks for your interest in improving anony-mail! Contributions of all
 kinds are welcome: bug reports, feature ideas, docs, and code.
 
 ## Development setup

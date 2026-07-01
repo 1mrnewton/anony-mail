@@ -30,7 +30,7 @@ pub async fn run() -> Result<()> {
         domains = ?config.domains,
         smtp = %config.smtp_bind_addr,
         api = %config.api_bind_addr,
-        "starting tempmail backend"
+        "starting anony-mail"
     );
 
     let pool = PgPoolOptions::new()
@@ -115,7 +115,7 @@ pub async fn run() -> Result<()> {
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,tempmail_backend=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,anony_mail=debug"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .try_init()

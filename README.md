@@ -1,4 +1,4 @@
-# tempmail-backend
+# anony-mail
 
 An inbound-only, disposable-email (temp mail) backend written in Rust. It
 **receives** email over SMTP for throwaway addresses and exposes it to a
@@ -63,7 +63,7 @@ Requires a Rust toolchain (edition 2024, i.e. Rust >= 1.85) and a PostgreSQL
 instance.
 
 ```bash
-export DATABASE_URL=postgres://tempmail:tempmail@localhost:5432/tempmail
+export DATABASE_URL=postgres://anonymail:anonymail@localhost:5432/anonymail
 export DOMAINS=example.com
 # Port 25 needs privileges; use a high port locally:
 export SMTP_BIND_ADDR=0.0.0.0:2525
@@ -170,7 +170,7 @@ disconnected and are not replayed.
 - **MX record:** point an MX record for each domain in `DOMAINS` at this
   server's public IP so other mail servers deliver here.
 - **Port 25:** binding it needs root or `CAP_NET_BIND_SERVICE`
-  (`setcap 'cap_net_bind_service=+ep' ./tempmail-backend`, or run in a container
+  (`setcap 'cap_net_bind_service=+ep' ./anony-mail`, or run in a container
   as root). This server only needs **inbound** 25 — the common cloud port-25
   block applies to *outbound* sending and does not affect receiving.
 - **TLS:** set `TLS_CERT_PATH`/`TLS_KEY_PATH` to advertise STARTTLS. Senders
@@ -191,7 +191,7 @@ reads the message back — using the in-memory store, so no database is required
 
 ```
 src/
-  main.rs            thin binary -> tempmail_backend::run()
+  main.rs            thin binary -> anony_mail::run()
   lib.rs             wiring: config, PgPool, migrations, task startup
   config.rs          env-based configuration
   model.rs           Mailbox, StoredMessage, Attachment, ...

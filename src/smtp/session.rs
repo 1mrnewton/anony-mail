@@ -75,7 +75,7 @@ impl Session {
     async fn run(&mut self, stream: MaybeTlsStream) -> io::Result<()> {
         let mut stream = BufReader::new(stream);
         let host = self.ctx.config.smtp_hostname.clone();
-        write_line(&mut stream, &format!("220 {host} ESMTP tempmail")).await?;
+        write_line(&mut stream, &format!("220 {host} ESMTP anony-mail")).await?;
 
         let mut line: Vec<u8> = Vec::new();
         loop {
@@ -205,7 +205,7 @@ impl Session {
                     write_line(&mut stream, "252 2.5.2 Cannot VRFY user").await?;
                 }
                 Command::Help => {
-                    write_line(&mut stream, "214 2.0.0 tempmail inbound-only SMTP").await?;
+                    write_line(&mut stream, "214 2.0.0 anony-mail inbound-only SMTP").await?;
                 }
                 Command::Unknown(_) => {
                     write_line(&mut stream, "500 5.5.2 Command not recognized").await?;

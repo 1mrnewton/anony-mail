@@ -14,7 +14,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations
 COPY src ./src
 
-RUN cargo build --release --bin tempmail-backend
+RUN cargo build --release --bin anony-mail
 
 # ---- Runtime stage ----
 FROM debian:bookworm-slim AS runtime
@@ -23,7 +23,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/tempmail-backend /usr/local/bin/tempmail-backend
+COPY --from=builder /app/target/release/anony-mail /usr/local/bin/anony-mail
 
 # SMTP (25) and HTTP API (8080).
 EXPOSE 25 8080
@@ -32,4 +32,4 @@ ENV SMTP_BIND_ADDR=0.0.0.0:25 \
     API_BIND_ADDR=0.0.0.0:8080 \
     RUST_LOG=info
 
-ENTRYPOINT ["/usr/local/bin/tempmail-backend"]
+ENTRYPOINT ["/usr/local/bin/anony-mail"]

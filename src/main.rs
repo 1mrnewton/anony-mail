@@ -2,5 +2,5 @@ use anyhow::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tempmail_backend::run().await
+    anony_mail::run().await
 }

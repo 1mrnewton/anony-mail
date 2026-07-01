@@ -9,10 +9,10 @@ use chrono::Utc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use tempmail_backend::config::Config;
-use tempmail_backend::events::EventBus;
-use tempmail_backend::smtp::SmtpContext;
-use tempmail_backend::store::{MemoryStore, Store};
+use anony_mail::config::Config;
+use anony_mail::events::EventBus;
+use anony_mail::smtp::SmtpContext;
+use anony_mail::store::{MemoryStore, Store};
 
 fn test_config() -> Config {
     Config {
@@ -87,7 +87,7 @@ async fn delivers_message_to_valid_recipient() {
 
     let server = tokio::spawn(async move {
         let (socket, peer) = listener.accept().await.unwrap();
-        tempmail_backend::smtp::session::handle(socket, peer, ctx)
+        anony_mail::smtp::session::handle(socket, peer, ctx)
             .await
             .unwrap();
     });
@@ -180,7 +180,7 @@ async fn rejects_message_with_no_valid_recipients() {
 
     let server = tokio::spawn(async move {
         let (socket, peer) = listener.accept().await.unwrap();
-        let _ = tempmail_backend::smtp::session::handle(socket, peer, ctx).await;
+        let _ = anony_mail::smtp::session::handle(socket, peer, ctx).await;
     });
 
     let mut stream = TcpStream::connect(addr).await.unwrap();
