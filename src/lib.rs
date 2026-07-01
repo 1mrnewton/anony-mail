@@ -10,7 +10,11 @@ pub mod store;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use axum::ServiceExt;
+use axum::extract::Request;
 use sqlx::postgres::PgPoolOptions;
+use tower::Layer;
+use tower_http::normalize_path::NormalizePathLayer;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -65,7 +69,11 @@ pub async fn run() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(api_addr)
         .await
         .with_context(|| format!("binding HTTP API listener on {api_addr}"))?;
+    // Axum 0.8 removed implicit trailing-slash redirects. Trim it *before*
+    // routing (NormalizePathLayer must wrap the whole router) so `/api/addresses/`
+    // is treated the same as `/api/addresses`.
     let router = api::router(app_state);
+    let app = NormalizePathLayer::trim_trailing_slash().layer(router);
 
     let smtp_task = tokio::spawn(async move { smtp::serve(smtp_ctx).await });
     let cleanup_task = {
@@ -75,7 +83,7 @@ pub async fn run() -> Result<()> {
     };
     let api_task = tokio::spawn(async move {
         info!(%api_addr, "HTTP API listening");
-        axum::serve(listener, router)
+        axum::serve(listener, ServiceExt::<Request>::into_make_service(app))
             .await
             .context("serving HTTP API")
     });

@@ -24,9 +24,10 @@ serde_json = "1.0.150"
 sqlx = { version = "0.9.0", default-features = false, features = ["chrono", "derive", "macros", "migrate", "postgres", "sqlite", "runtime-tokio", "tls-rustls-ring", "uuid"] }
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
+tower = "0.5.3"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
 tokio-stream = { version = "0.1.18", features = ["sync"] }
-tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+tower-http = { version = "0.7.0", features = ["cors", "normalize-path", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
