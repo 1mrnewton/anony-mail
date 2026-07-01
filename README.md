@@ -6,13 +6,15 @@ frontend over a REST + Server-Sent-Events HTTP API. It does not send mail.
 
 - Hand-rolled async SMTP receiver on `tokio` (EHLO/HELO, MAIL, RCPT, DATA,
   RSET, NOOP, QUIT, VRFY, HELP, optional STARTTLS).
-- Recipients are validated at `RCPT TO` against PostgreSQL, so mail to unknown
+- Recipients are validated at `RCPT TO` against the database, so mail to unknown
   or expired addresses is rejected at the SMTP layer instead of being stored.
 - MIME parsing via [`mail-parser`](https://crates.io/crates/mail-parser)
   (subject, from, date, text/html bodies, attachments).
 - REST API for creating addresses and reading messages, plus an SSE stream that
   pushes a lightweight event the moment a message arrives.
 - Background task purges expired mailboxes (messages/attachments cascade).
+- Pluggable storage behind a `Store` trait: **SQLite by default** (zero external
+  dependencies), or PostgreSQL by setting a `postgres://` `DATABASE_URL`.
 
 ## Architecture
 
@@ -31,8 +33,9 @@ frontend over a REST + Server-Sent-Events HTTP API. It does not send mail.
                                                    └──────────────┘
 ```
 
-All three run as concurrent tasks in one process sharing a single `PgPool`. New
-messages are published on a `tokio::sync::broadcast` channel; the SSE endpoint
+All three run as concurrent tasks in one process sharing a single database
+connection pool. New messages are published on a `tokio::sync::broadcast`
+channel; the SSE endpoint
 subscribes and forwards events for the requested address. SSE is a low-latency
 *nudge* — the REST inbox listing remains the source of truth for reconciliation.
 
@@ -43,8 +46,16 @@ cp .env.example .env          # optional: values below can also come from compos
 docker compose up --build
 ```
 
-This starts PostgreSQL and the app, running migrations automatically on boot.
-Edit `DOMAINS`/`SMTP_HOSTNAME` in `docker-compose.yml` for your real domains.
+This starts the app with the default SQLite backend, stored on the `maildata`
+volume so it survives restarts and redeploys, running migrations automatically
+on boot. Edit `DOMAINS`/`SMTP_HOSTNAME` in `docker-compose.yml` for your domains.
+
+To use PostgreSQL instead, start the optional service and switch the app's
+`DATABASE_URL` (both shown in `docker-compose.yml`):
+
+```bash
+docker compose --profile postgres up --build
+```
 
 Then create an address and watch for mail:
 
@@ -59,19 +70,21 @@ curl -s http://localhost:8080/api/addresses/a1b2c3d4e5@example.com/messages | jq
 
 ## Local development (without Docker)
 
-Requires a Rust toolchain (edition 2024, i.e. Rust >= 1.85) and a PostgreSQL
-instance.
+Requires only a Rust toolchain (edition 2024, i.e. Rust >= 1.85); the default
+SQLite backend needs no external services.
 
 ```bash
-export DATABASE_URL=postgres://anonymail:anonymail@localhost:5432/anonymail
 export DOMAINS=example.com
 # Port 25 needs privileges; use a high port locally:
 export SMTP_BIND_ADDR=0.0.0.0:2525
+# DATABASE_URL defaults to sqlite://data/anony-mail.db. To use Postgres:
+# export DATABASE_URL=postgres://anonymail:anonymail@localhost:5432/anonymail
 
 cargo run
 ```
 
-Migrations in `migrations/` are embedded into the binary and run on startup.
+Per-backend migrations (`migrations/sqlite`, `migrations/postgres`) are embedded
+into the binary and run on startup.
 
 Send a test message with any SMTP client (e.g. `swaks`), after creating the
 recipient address via the API:
@@ -83,12 +96,12 @@ swaks --server localhost:2525 --to a1b2c3d4e5@example.com --from me@somewhere.te
 ## Configuration
 
 All configuration is via environment variables (see [.env.example](.env.example)).
-`DOMAINS` and `DATABASE_URL` are required; everything else has defaults.
+Only `DOMAINS` is required; everything else has defaults.
 
 | Variable | Default | Description |
 | --- | --- | --- |
 | `DOMAINS` | — (required) | Comma-separated domains to accept mail for |
-| `DATABASE_URL` | — (required) | PostgreSQL connection string |
+| `DATABASE_URL` | `sqlite://data/anony-mail.db` | DB connection string: `sqlite://<path>` or `postgres://…` |
 | `SMTP_BIND_ADDR` | `0.0.0.0:25` | SMTP listener address |
 | `API_BIND_ADDR` | `0.0.0.0:8080` | HTTP API listener address |
 | `SMTP_HOSTNAME` | first domain | Hostname announced in the SMTP banner/EHLO |
@@ -102,6 +115,37 @@ All configuration is via environment variables (see [.env.example](.env.example)
 | `TLS_CERT_PATH` / `TLS_KEY_PATH` | unset | Enable STARTTLS (PEM files) |
 | `CORS_ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins, or `*` |
 | `RUST_LOG` | `info` | `tracing` env-filter directive |
+
+## Storage backends
+
+Storage sits behind a `Store` trait, selected at startup from the `DATABASE_URL`
+scheme:
+
+- **SQLite (default).** A single file with zero external dependencies — a good
+  fit for a single VPS. Selected by a `sqlite://<path>` URL (or by leaving
+  `DATABASE_URL` unset). Opened in WAL mode with foreign keys enforced; the file
+  and its parent directory are created on first run. SQLite has a single writer,
+  so very high inbound volume is the main reason to reach for Postgres.
+- **PostgreSQL (optional).** Set a `postgres://…` URL to switch. Suited to high
+  write concurrency or when the database must be reachable from other hosts.
+
+### Persistence in Docker
+
+A container's filesystem is ephemeral — it is discarded whenever the container
+is recreated (redeploys, image updates). Data persists only on a mounted volume:
+
+- **SQLite:** mount a volume at the directory holding the file and point
+  `DATABASE_URL` there. The compose file does this by default (`maildata:/data`
+  with `DATABASE_URL=sqlite:///data/anony-mail.db`). WAL creates `-wal`/`-shm`
+  sidecar files, so mount the directory, not just the file.
+- **PostgreSQL:** the optional `postgres` service mounts `pgdata` at
+  `/var/lib/postgresql/data`.
+
+Data then survives restarts and redeploys for as long as the volume exists
+(`docker compose down -v` deletes volumes). Back up SQLite by copying the file
+(`sqlite3 anony-mail.db ".backup backup.db"`) or Postgres with `pg_dump`. Since
+mailboxes expire (`DEFAULT_TTL_SECONDS`) and are purged, persistence here means
+surviving restarts — not retaining mail indefinitely.
 
 ## HTTP API
 
@@ -192,16 +236,16 @@ reads the message back — using the in-memory store, so no database is required
 ```
 src/
   main.rs            thin binary -> anony_mail::run()
-  lib.rs             wiring: config, PgPool, migrations, task startup
+  lib.rs             wiring: config, DB pool/backend, migrations, task startup
   config.rs          env-based configuration
   model.rs           Mailbox, StoredMessage, Attachment, ...
   events.rs          broadcast event bus for SSE
   mime.rs            mail-parser -> NewMessage
   cleanup.rs         expired-mailbox purge task
-  store/             Store trait + Postgres and in-memory implementations
+  store/             Store trait + SQLite, Postgres, and in-memory backends
   smtp/              accept loop, session state machine, commands, STARTTLS
   api/               Axum router, address/message handlers, SSE
-migrations/          SQL migrations (embedded at build time)
+migrations/          per-backend SQL migrations: sqlite/, postgres/
 tests/               end-to-end SMTP delivery test
 ```
 
