@@ -41,20 +41,26 @@ subscribes and forwards events for the requested address. SSE is a low-latency
 
 ## Quick start (Docker Compose)
 
+Uses the prebuilt image published to GitHub Container Registry
+(`ghcr.io/1mrnewton/anony-mail`), so there is nothing to compile:
+
 ```bash
 cp .env.example .env          # optional: values below can also come from compose
-docker compose up --build
+docker compose pull           # fetch the prebuilt image
+docker compose up -d
 ```
 
 This starts the app with the default SQLite backend, stored on the `maildata`
 volume so it survives restarts and redeploys, running migrations automatically
 on boot. Edit `DOMAINS`/`SMTP_HOSTNAME` in `docker-compose.yml` for your domains.
+Pin a specific version with `ANONY_MAIL_TAG=0.1.0 docker compose up -d`.
 
 To use PostgreSQL instead, start the optional service and switch the app's
 `DATABASE_URL` (both shown in `docker-compose.yml`):
 
 ```bash
-docker compose --profile postgres up --build
+docker compose --profile postgres pull
+docker compose --profile postgres up -d
 ```
 
 Then create an address and watch for mail:
@@ -220,6 +226,36 @@ disconnected and are not replayed.
 - **TLS:** set `TLS_CERT_PATH`/`TLS_KEY_PATH` to advertise STARTTLS. Senders
   fall back to plaintext when it is not offered, so it is optional but
   recommended.
+
+## Publishing releases (maintainers)
+
+The distributed Docker image is built **locally** and pushed to GHCR — CI only
+runs `fmt`/`clippy`/`test`, it does not build or publish the image. To cut a
+release:
+
+1. Bump `version` in `Cargo.toml` (this is the image tag) and commit.
+2. Log in once with a GitHub Personal Access Token that has the `write:packages`
+   scope (create at <https://github.com/settings/tokens>):
+
+   ```bash
+   export GHCR_TOKEN=ghp_your_token_here
+   make docker-login
+   ```
+
+3. Build the multi-arch image (`linux/amd64` + `linux/arm64`) and push both the
+   version tag and `latest`:
+
+   ```bash
+   make publish
+   ```
+
+Users then pick it up with `docker compose pull`. Run `make help` to see all
+targets; `make docker-build` produces a single-arch image locally without
+pushing (handy for testing or building from source).
+
+> The first push creates the `anony-mail` package under your GitHub account. Set
+> its visibility to **Public** in the package settings so users can pull without
+> authenticating.
 
 ## Testing
 

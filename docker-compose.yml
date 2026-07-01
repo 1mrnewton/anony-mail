@@ -1,6 +1,10 @@
 services:
   app:
-    build: .
+    # Prebuilt multi-arch image published to GitHub Container Registry. Pull it
+    # with `docker compose pull`; no local Rust build required. Override the tag
+    # with e.g. `ANONY_MAIL_TAG=0.1.0 docker compose up -d`.
+    # To build from source instead, run `make docker-build` (see Makefile).
+    image: ghcr.io/1mrnewton/anony-mail:${ANONY_MAIL_TAG:-latest}
     environment:
       # Default backend: SQLite, stored on the named volume mounted at /data so
       # messages survive container restarts and redeploys.

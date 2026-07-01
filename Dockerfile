@@ -19,6 +19,12 @@ RUN cargo build --release --bin anony-mail
 # ---- Runtime stage ----
 FROM debian:bookworm-slim AS runtime
 
+# Links the published GHCR package to the source repo (populates the repo's
+# "Packages" sidebar) and surfaces metadata on the package page.
+LABEL org.opencontainers.image.source="https://github.com/1mrnewton/anony-mail" \
+      org.opencontainers.image.description="Inbound-only disposable email (temp mail) backend: SMTP in, REST + SSE out." \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
