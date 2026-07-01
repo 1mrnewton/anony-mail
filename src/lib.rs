@@ -14,13 +14,14 @@ use sqlx::postgres::PgPoolOptions;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
+use crate::config::{Config, DbBackend};
 use crate::events::EventBus;
 use crate::smtp::SmtpContext;
-use crate::store::{PostgresStore, Store};
+use crate::store::{PostgresStore, SqliteStore, Store};
 
-/// Boot the whole service: load config, connect + migrate Postgres, then run
-/// the SMTP receiver, HTTP API, and cleanup task until shutdown.
+/// Boot the whole service: load config, connect + migrate the configured
+/// database, then run the SMTP receiver, HTTP API, and cleanup task until
+/// shutdown.
 pub async fn run() -> Result<()> {
     dotenvy::dotenv().ok();
     init_tracing();
@@ -33,18 +34,7 @@ pub async fn run() -> Result<()> {
         "starting anony-mail"
     );
 
-    let pool = PgPoolOptions::new()
-        .max_connections(10)
-        .connect(&config.database_url)
-        .await
-        .context("connecting to PostgreSQL")?;
-
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .context("running database migrations")?;
-
-    let store: Arc<dyn Store> = Arc::new(PostgresStore::new(pool));
+    let store = build_store(&config).await?;
     let events = EventBus::new(1024);
 
     let tls_acceptor = match &config.tls {
@@ -111,6 +101,49 @@ pub async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Connect to the configured database, run its migrations, and return the
+/// matching [`Store`] behind a trait object so the rest of the app is backend-
+/// agnostic.
+async fn build_store(config: &Config) -> Result<Arc<dyn Store>> {
+    match config.db_backend() {
+        DbBackend::Postgres => {
+            let pool = PgPoolOptions::new()
+                .max_connections(10)
+                .connect(&config.database_url)
+                .await
+                .context("connecting to PostgreSQL")?;
+            sqlx::migrate!("./migrations/postgres")
+                .run(&pool)
+                .await
+                .context("running PostgreSQL migrations")?;
+            info!("storage backend: PostgreSQL");
+            Ok(Arc::new(PostgresStore::new(pool)))
+        }
+        DbBackend::Sqlite => {
+            let path = sqlite_file_path(&config.database_url);
+            let store = SqliteStore::connect(&path).await?;
+            info!(path = %path, "storage backend: SQLite");
+            Ok(Arc::new(store))
+        }
+    }
+}
+
+/// Extracts the filesystem path from a `sqlite:` connection string, tolerating
+/// the common `sqlite:`, `sqlite://`, and `sqlite:///` prefixes and stripping
+/// any `?query` parameters.
+fn sqlite_file_path(url: &str) -> String {
+    let raw = url.trim();
+    let without_scheme = raw
+        .strip_prefix("sqlite://")
+        .or_else(|| raw.strip_prefix("sqlite:"))
+        .unwrap_or(raw);
+    without_scheme
+        .split('?')
+        .next()
+        .unwrap_or(without_scheme)
+        .to_string()
 }
 
 fn init_tracing() {

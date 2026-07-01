@@ -1,7 +1,18 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
+
+/// Connection string used when `DATABASE_URL` is unset: a SQLite file in a
+/// `data/` directory relative to the working directory.
+pub const DEFAULT_SQLITE_URL: &str = "sqlite://data/anony-mail.db";
+
+/// Which storage backend a [`Config`] selects, derived from `DATABASE_URL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbBackend {
+    Sqlite,
+    Postgres,
+}
 
 /// Runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
@@ -12,7 +23,8 @@ pub struct Config {
     pub api_bind_addr: SocketAddr,
     /// Domains this server accepts mail for. Always lowercased.
     pub domains: Vec<String>,
-    /// Postgres connection string.
+    /// Database connection string. `sqlite://<path>` (the default) selects the
+    /// embedded SQLite backend; `postgres://…` selects PostgreSQL.
     pub database_url: String,
     /// How long a freshly created mailbox lives before it expires.
     pub default_ttl: Duration,
@@ -54,8 +66,12 @@ impl Config {
             bail!("DOMAINS must be set to a comma-separated list of accepted domains");
         }
 
+        // Defaults to a local SQLite file so the service runs with zero external
+        // dependencies. Set a `postgres://` URL to switch backends.
         let database_url = std::env::var("DATABASE_URL")
-            .context("DATABASE_URL environment variable is required")?;
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_SQLITE_URL.to_string());
 
         let smtp_bind_addr = parse_env("SMTP_BIND_ADDR", "0.0.0.0:25")?;
         let api_bind_addr = parse_env("API_BIND_ADDR", "0.0.0.0:8080")?;
@@ -108,6 +124,17 @@ impl Config {
             smtp_hostname,
             tls,
         })
+    }
+
+    /// Selects the storage backend from the `DATABASE_URL` scheme. Anything
+    /// that is not a `postgres://`/`postgresql://` URL is treated as SQLite.
+    pub fn db_backend(&self) -> DbBackend {
+        let url = self.database_url.trim();
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            DbBackend::Postgres
+        } else {
+            DbBackend::Sqlite
+        }
     }
 
     /// Returns true if `domain` (case-insensitive) is one this server accepts.

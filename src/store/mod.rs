@@ -1,5 +1,6 @@
 pub mod memory;
 pub mod postgres;
+pub mod sqlite;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -9,6 +10,7 @@ use crate::model::{Attachment, Mailbox, MessageSummary, NewMessage, StoredMessag
 
 pub use memory::MemoryStore;
 pub use postgres::PostgresStore;
+pub use sqlite::SqliteStore;
 
 /// Persistence abstraction for mailboxes, messages, and attachments.
 ///
