@@ -1,0 +1,32 @@
+[package]
+name = "tempmail-backend"
+version = "0.1.0"
+edition = "2024"
+description = "Inbound-only disposable email (temp mail) backend: receives mail over SMTP and serves it via a REST + SSE API."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/1mrnewton/tempmail-backend-rust"
+readme = "README.md"
+keywords = ["email", "smtp", "tempmail", "disposable-email", "mail-server"]
+categories = ["email", "web-programming::http-server"]
+
+[dependencies]
+anyhow = "1.0.103"
+async-trait = "0.1.89"
+axum = "0.8.9"
+chrono = { version = "0.4.45", default-features = false, features = ["serde", "clock"] }
+dotenvy = "0.15.7"
+futures = "0.3.32"
+mail-parser = "0.11.4"
+rand = "0.10.1"
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sqlx = { version = "0.9.0", default-features = false, features = ["chrono", "derive", "macros", "migrate", "postgres", "runtime-tokio", "tls-rustls-ring", "uuid"] }
+thiserror = "2.0.18"
+tokio = { version = "1.52.3", features = ["full"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-stream = { version = "0.1.18", features = ["sync"] }
+tower-http = { version = "0.7.0", features = ["cors", "trace"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+uuid = { version = "1.23.4", features = ["v4", "serde"] }
