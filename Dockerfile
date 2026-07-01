@@ -28,8 +28,13 @@ COPY --from=builder /app/target/release/anony-mail /usr/local/bin/anony-mail
 # SMTP (25) and HTTP API (8080).
 EXPOSE 25 8080
 
+# Default to the embedded SQLite backend, stored under /data. Mount a volume
+# there (see docker-compose.yml) so the database survives container recreation.
 ENV SMTP_BIND_ADDR=0.0.0.0:25 \
     API_BIND_ADDR=0.0.0.0:8080 \
+    DATABASE_URL=sqlite:///data/anony-mail.db \
     RUST_LOG=info
+
+VOLUME ["/data"]
 
 ENTRYPOINT ["/usr/local/bin/anony-mail"]

@@ -1,6 +1,34 @@
 services:
+  app:
+    build: .
+    environment:
+      # Default backend: SQLite, stored on the named volume mounted at /data so
+      # messages survive container restarts and redeploys.
+      DATABASE_URL: sqlite:///data/anony-mail.db
+      # To use PostgreSQL instead, start the optional service below with
+      #   docker compose --profile postgres up --build
+      # and point the app at it:
+      # DATABASE_URL: postgres://anonymail:anonymail@postgres:5432/anonymail
+      # Change these to your real domains (MX must point at this host).
+      DOMAINS: example.com
+      SMTP_HOSTNAME: mail.example.com
+      DEFAULT_TTL_SECONDS: "3600"
+      CORS_ALLOWED_ORIGINS: "*"
+      RUST_LOG: "info,anony_mail=debug"
+    volumes:
+      - maildata:/data
+    ports:
+      # Left side is the host port. Inbound SMTP must be reachable on 25 in
+      # production; use e.g. "2525:25" locally if host port 25 is taken.
+      - "25:25"
+      - "8080:8080"
+
+  # Optional PostgreSQL backend. Only started when the `postgres` profile is
+  # active: `docker compose --profile postgres up`. Remember to also switch the
+  # app's DATABASE_URL to the postgres:// line above.
   postgres:
     image: postgres:17-alpine
+    profiles: ["postgres"]
     environment:
       POSTGRES_USER: anonymail
       POSTGRES_PASSWORD: anonymail
@@ -16,24 +44,6 @@ services:
     ports:
       - "5432:5432"
 
-  app:
-    build: .
-    depends_on:
-      postgres:
-        condition: service_healthy
-    environment:
-      DATABASE_URL: postgres://anonymail:anonymail@postgres:5432/anonymail
-      # Change these to your real domains (MX must point at this host).
-      DOMAINS: example.com
-      SMTP_HOSTNAME: mail.example.com
-      DEFAULT_TTL_SECONDS: "3600"
-      CORS_ALLOWED_ORIGINS: "*"
-      RUST_LOG: "info,anony_mail=debug"
-    ports:
-      # Left side is the host port. Inbound SMTP must be reachable on 25 in
-      # production; use e.g. "2525:25" locally if host port 25 is taken.
-      - "25:25"
-      - "8080:8080"
-
 volumes:
+  maildata:
   pgdata:
