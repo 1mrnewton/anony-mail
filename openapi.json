@@ -1,0 +1,830 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "anony-mail API",
+    "version": "0.1.0",
+    "summary": "REST + Server-Sent Events API for an inbound-only disposable email backend.",
+    "description": "anony-mail is an inbound-only disposable email (temp mail) backend. It receives mail over SMTP for throwaway addresses and exposes it through this HTTP API. It does **not** send mail.\n\n### Conventions\n- **Base path:** every resource endpoint lives under `/api`; the health check is at `/healthz`.\n- **Content type:** request and response bodies are JSON, except attachment downloads (raw bytes) and the events endpoint (an SSE stream).\n- **Addresses are case-insensitive.** They are lowercased server-side before lookup or creation, so `Foo@Example.com` and `foo@example.com` refer to the same mailbox.\n- **Timestamps** are UTC in RFC 3339 / ISO 8601 format (e.g. `2026-07-01T11:23:45.123456Z`).\n- **IDs** (message and attachment) are UUIDs (v4).\n\n### Errors\nOn failure the API returns the matching HTTP status code with a JSON body of the form `{ \"error\": \"message\" }`. A `500` always reports a generic `\"internal server error\"` message; details are logged server-side.\n\n### Authentication\nThere is **no authentication** in v1: anyone who can reach the API can create addresses and read any mailbox's mail. Put it behind your own auth/proxy if you need access control, and restrict browser access with the `CORS_ALLOWED_ORIGINS` setting.\n\n### Mailbox lifecycle\nMailboxes expire after `DEFAULT_TTL_SECONDS` (default 1 hour) and are periodically purged along with their messages and attachments. Use `POST /api/addresses/{address}/extend` to push the expiry back.",
+    "license": {
+      "name": "MIT OR Apache-2.0",
+      "identifier": "MIT OR Apache-2.0"
+    },
+    "contact": {
+      "name": "anony-mail source & issues",
+      "url": "https://github.com/1mrnewton/anony-mail"
+    }
+  },
+  "externalDocs": {
+    "description": "Project README",
+    "url": "https://github.com/1mrnewton/anony-mail#readme"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "Local development (default API_BIND_ADDR)"
+    },
+    {
+      "url": "https://{host}",
+      "description": "Deployed instance",
+      "variables": {
+        "host": {
+          "default": "api.example.com",
+          "description": "Hostname where your anony-mail instance is reachable."
+        }
+      }
+    }
+  ],
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Liveness/readiness probe."
+    },
+    {
+      "name": "Domains",
+      "description": "Discover which domains this server accepts mail for."
+    },
+    {
+      "name": "Mailboxes",
+      "description": "Create, inspect, extend, and delete disposable addresses."
+    },
+    {
+      "name": "Messages",
+      "description": "List and read received messages, and download attachments."
+    },
+    {
+      "name": "Events",
+      "description": "Live push notifications of newly arrived mail via Server-Sent Events."
+    }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "operationId": "healthCheck",
+        "summary": "Health check",
+        "description": "Simple liveness probe. Always returns `200` with `{ \"status\": \"ok\" }` when the HTTP server is up.",
+        "tags": ["Health"],
+        "responses": {
+          "200": {
+            "description": "The service is up.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" },
+                "example": { "status": "ok" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/domains": {
+      "get": {
+        "operationId": "listDomains",
+        "summary": "List configured domains",
+        "description": "Returns the domains this server accepts mail for (the `DOMAINS` setting). The first entry is the default used when creating an address without specifying a domain.",
+        "tags": ["Domains"],
+        "responses": {
+          "200": {
+            "description": "The list of accepted domains.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/DomainsResponse" },
+                "examples": {
+                  "single": {
+                    "summary": "One configured domain",
+                    "value": { "domains": ["example.com"] }
+                  },
+                  "multiple": {
+                    "summary": "Several configured domains",
+                    "value": { "domains": ["example.com", "mail.example.org"] }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/addresses": {
+      "post": {
+        "operationId": "createAddress",
+        "summary": "Create a disposable address",
+        "description": "Creates a new mailbox and returns it. The request body is **optional**:\n\n- Omit the body entirely (or send `{}`) to get a random 10-character local part on the first configured domain.\n- Provide `domain` to choose among the configured domains.\n- Provide `local_part` to request a custom address. It must be 1–64 characters of `[a-z0-9._-]` and must not start or end with a separator (`.`, `_`, `-`). If the address is already taken, the request fails with `409 Conflict`.\n\nThe new mailbox expires after the server's default TTL (`DEFAULT_TTL_SECONDS`, 1 hour by default).",
+        "tags": ["Mailboxes"],
+        "requestBody": {
+          "required": false,
+          "description": "Optional address creation options.",
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateAddressRequest" },
+              "examples": {
+                "random": {
+                  "summary": "Random address on the default domain (empty body)",
+                  "value": {}
+                },
+                "domainOnly": {
+                  "summary": "Random local part on a chosen domain",
+                  "value": { "domain": "example.com" }
+                },
+                "custom": {
+                  "summary": "Custom local part on a chosen domain",
+                  "value": { "local_part": "jane.doe", "domain": "example.com" }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Mailbox created.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Mailbox" },
+                "examples": {
+                  "random": {
+                    "summary": "Randomly generated address",
+                    "value": {
+                      "address": "a1b2c3d4e5@example.com",
+                      "domain": "example.com",
+                      "created_at": "2026-07-01T11:23:45.123456Z",
+                      "expires_at": "2026-07-01T12:23:45.123456Z"
+                    }
+                  },
+                  "custom": {
+                    "summary": "Custom address",
+                    "value": {
+                      "address": "jane.doe@example.com",
+                      "domain": "example.com",
+                      "created_at": "2026-07-01T11:23:45.123456Z",
+                      "expires_at": "2026-07-01T12:23:45.123456Z"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "409": {
+            "description": "The requested custom address already exists.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": "address already exists: jane.doe@example.com" }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/addresses/{address}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/AddressPath" }
+      ],
+      "get": {
+        "operationId": "getMailbox",
+        "summary": "Get mailbox info / check existence",
+        "description": "Returns the mailbox's metadata if it exists. Note that an expired-but-not-yet-purged mailbox is still returned here; compare `expires_at` against the current time to determine whether it is still active.",
+        "tags": ["Mailboxes"],
+        "responses": {
+          "200": {
+            "description": "The mailbox exists.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Mailbox" },
+                "example": {
+                  "address": "a1b2c3d4e5@example.com",
+                  "domain": "example.com",
+                  "created_at": "2026-07-01T11:23:45.123456Z",
+                  "expires_at": "2026-07-01T12:23:45.123456Z"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/MailboxNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteMailbox",
+        "summary": "Delete a mailbox",
+        "description": "Deletes the mailbox and all of its messages and attachments (cascading). Returns `204 No Content` on success.",
+        "tags": ["Mailboxes"],
+        "responses": {
+          "204": {
+            "description": "Mailbox deleted."
+          },
+          "404": {
+            "$ref": "#/components/responses/MailboxNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/addresses/{address}/extend": {
+      "parameters": [
+        { "$ref": "#/components/parameters/AddressPath" }
+      ],
+      "post": {
+        "operationId": "extendMailbox",
+        "summary": "Extend a mailbox's expiry",
+        "description": "Pushes the mailbox's `expires_at` to now + the server default TTL (`DEFAULT_TTL_SECONDS`). The extension is relative to the current time, not to the previous expiry. No request body is required.",
+        "tags": ["Mailboxes"],
+        "responses": {
+          "200": {
+            "description": "Expiry extended; the updated mailbox is returned.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Mailbox" },
+                "example": {
+                  "address": "a1b2c3d4e5@example.com",
+                  "domain": "example.com",
+                  "created_at": "2026-07-01T11:23:45.123456Z",
+                  "expires_at": "2026-07-01T13:05:10.900000Z"
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/MailboxNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/addresses/{address}/messages": {
+      "parameters": [
+        { "$ref": "#/components/parameters/AddressPath" }
+      ],
+      "get": {
+        "operationId": "listMessages",
+        "summary": "List messages in a mailbox",
+        "description": "Returns lightweight summaries of the mailbox's messages, newest first. Bodies and attachment metadata are omitted here — fetch a single message for the full content. An existing mailbox with no mail returns `200` with an empty array `[]`; a missing mailbox returns `404`.",
+        "tags": ["Messages"],
+        "responses": {
+          "200": {
+            "description": "Message summaries, newest first (possibly empty).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/MessageSummary" }
+                },
+                "examples": {
+                  "withMail": {
+                    "summary": "A mailbox with two messages",
+                    "value": [
+                      {
+                        "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                        "mail_from": "no-reply@service.test",
+                        "subject": "Your verification code",
+                        "received_at": "2026-07-01T11:40:12.500000Z",
+                        "has_attachments": false
+                      },
+                      {
+                        "id": "550e8400-e29b-41d4-a716-446655440000",
+                        "mail_from": "billing@shop.test",
+                        "subject": "Invoice #1042",
+                        "received_at": "2026-07-01T11:24:10.000000Z",
+                        "has_attachments": true
+                      }
+                    ]
+                  },
+                  "empty": {
+                    "summary": "Existing mailbox, no mail yet",
+                    "value": []
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/MailboxNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/addresses/{address}/messages/{id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/AddressPath" },
+        { "$ref": "#/components/parameters/MessageIdPath" }
+      ],
+      "get": {
+        "operationId": "getMessage",
+        "summary": "Get a full message",
+        "description": "Returns a single message including its text and/or HTML bodies and attachment metadata. Attachment bytes are not inlined — download them individually via the attachments endpoint using each attachment's `id`.",
+        "tags": ["Messages"],
+        "responses": {
+          "200": {
+            "description": "The full message.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/StoredMessage" },
+                "examples": {
+                  "withAttachment": {
+                    "summary": "Message with one PDF attachment",
+                    "value": {
+                      "id": "550e8400-e29b-41d4-a716-446655440000",
+                      "mailbox_address": "a1b2c3d4e5@example.com",
+                      "mail_from": "billing@shop.test",
+                      "subject": "Invoice #1042",
+                      "message_date": "2026-07-01T11:24:05.000000Z",
+                      "text_body": "Thanks for your order. Your invoice is attached.",
+                      "html_body": "<p>Thanks for your order. Your invoice is attached.</p>",
+                      "raw_size": 20841,
+                      "received_at": "2026-07-01T11:24:10.000000Z",
+                      "attachments": [
+                        {
+                          "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                          "filename": "invoice-1042.pdf",
+                          "content_type": "application/pdf",
+                          "size": 18240
+                        }
+                      ]
+                    }
+                  },
+                  "textOnly": {
+                    "summary": "Plain-text message, no attachments",
+                    "value": {
+                      "id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+                      "mailbox_address": "a1b2c3d4e5@example.com",
+                      "mail_from": "no-reply@service.test",
+                      "subject": "Your verification code",
+                      "message_date": "2026-07-01T11:40:08.000000Z",
+                      "text_body": "Your verification code is 123456. It expires in 10 minutes.",
+                      "html_body": null,
+                      "raw_size": 512,
+                      "received_at": "2026-07-01T11:40:12.500000Z",
+                      "attachments": []
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "$ref": "#/components/responses/MessageNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteMessage",
+        "summary": "Delete a single message",
+        "description": "Deletes one message (and its attachments) from the mailbox. Returns `204 No Content` on success.",
+        "tags": ["Messages"],
+        "responses": {
+          "204": {
+            "description": "Message deleted."
+          },
+          "404": {
+            "$ref": "#/components/responses/MessageNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/addresses/{address}/messages/{id}/attachments/{attachment_id}": {
+      "parameters": [
+        { "$ref": "#/components/parameters/AddressPath" },
+        { "$ref": "#/components/parameters/MessageIdPath" },
+        { "$ref": "#/components/parameters/AttachmentIdPath" }
+      ],
+      "get": {
+        "operationId": "getAttachment",
+        "summary": "Download an attachment",
+        "description": "Streams the raw bytes of an attachment. The response's `Content-Type` is the attachment's stored MIME type (falling back to `application/octet-stream` if it is not a valid header value), and `Content-Disposition` is set to `attachment` with a sanitized filename to prompt a download.",
+        "tags": ["Messages"],
+        "responses": {
+          "200": {
+            "description": "Raw attachment bytes.",
+            "headers": {
+              "Content-Type": {
+                "description": "The attachment's stored MIME type, e.g. `application/pdf`.",
+                "schema": { "type": "string" }
+              },
+              "Content-Disposition": {
+                "description": "Download disposition with a sanitized ASCII filename.",
+                "schema": { "type": "string" },
+                "example": "attachment; filename=\"invoice-1042.pdf\""
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary",
+                  "description": "Raw attachment content."
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "The attachment (or its message/mailbox) was not found.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" },
+                "example": { "error": "attachment not found" }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/addresses/{address}/events": {
+      "parameters": [
+        { "$ref": "#/components/parameters/AddressPath" }
+      ],
+      "get": {
+        "operationId": "streamEvents",
+        "summary": "Stream new-message events (SSE)",
+        "description": "Opens a [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) stream that pushes one event named `message` each time mail arrives for this address. The event's `data` field is a JSON-encoded `MailEvent` (see the schema).\n\nThe stream sends periodic keep-alive comments to hold the connection open. It is a low-latency **nudge** only: events may be missed while disconnected and are not replayed, so on (re)connect always re-fetch `GET /api/addresses/{address}/messages` to reconcile.\n\nExample (browser):\n\n```js\nconst es = new EventSource(\n  `/api/addresses/${encodeURIComponent(address)}/events`\n);\nes.addEventListener(\"message\", (e) => {\n  const evt = JSON.parse(e.data); // MailEvent\n  // fetch the full message, or refresh the inbox listing\n});\n```\n\nNote: this endpoint does not validate that the mailbox exists; subscribing to an unknown or expired address simply yields a stream that never emits.",
+        "tags": ["Events"],
+        "responses": {
+          "200": {
+            "description": "An open `text/event-stream`. Each `message` event carries a JSON `MailEvent` in its `data` field.",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string",
+                  "description": "SSE-framed stream. Each record is `event: message\\ndata: <MailEvent JSON>\\n\\n`. See the MailEvent schema for the data shape.",
+                  "contentMediaType": "application/json"
+                },
+                "example": "event: message\ndata: {\"address\":\"a1b2c3d4e5@example.com\",\"id\":\"550e8400-e29b-41d4-a716-446655440000\",\"mail_from\":\"billing@shop.test\",\"subject\":\"Invoice #1042\",\"received_at\":\"2026-07-01T11:24:10.000000Z\",\"has_attachments\":true}\n\n"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "AddressPath": {
+        "name": "address",
+        "in": "path",
+        "required": true,
+        "description": "Full email address of the mailbox. Case-insensitive (lowercased server-side). The `@` may be sent literally or percent-encoded as `%40`.",
+        "schema": {
+          "type": "string",
+          "format": "email",
+          "examples": ["a1b2c3d4e5@example.com"]
+        }
+      },
+      "MessageIdPath": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Message UUID.",
+        "schema": {
+          "type": "string",
+          "format": "uuid",
+          "examples": ["550e8400-e29b-41d4-a716-446655440000"]
+        }
+      },
+      "AttachmentIdPath": {
+        "name": "attachment_id",
+        "in": "path",
+        "required": true,
+        "description": "Attachment UUID (from a message's `attachments[].id`).",
+        "schema": {
+          "type": "string",
+          "format": "uuid",
+          "examples": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "The request was invalid (e.g. unknown domain or malformed `local_part`).",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "examples": {
+              "unknownDomain": {
+                "summary": "Domain is not in the server's DOMAINS list",
+                "value": { "error": "unknown domain: nope.test" }
+              },
+              "invalidLocalPart": {
+                "summary": "local_part failed validation",
+                "value": { "error": "local_part must be 1-64 chars of a-z, 0-9, '.', '_' or '-' and not start/end with a separator" }
+              }
+            }
+          }
+        }
+      },
+      "MailboxNotFound": {
+        "description": "No mailbox exists for this address.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": { "error": "mailbox not found" }
+          }
+        }
+      },
+      "MessageNotFound": {
+        "description": "No such message in this mailbox.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": { "error": "message not found" }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "An unexpected server error occurred. Details are logged server-side.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" },
+            "example": { "error": "internal server error" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "CreateAddressRequest": {
+        "type": "object",
+        "description": "Options for creating a mailbox. Every field is optional; an empty object (or no body) yields a random address on the first configured domain. Unknown fields are ignored.",
+        "properties": {
+          "local_part": {
+            "type": ["string", "null"],
+            "description": "Custom local part (the portion before `@`). Must be 1–64 characters of `[a-z0-9._-]` and must not start or end with a separator (`.`, `_`, `-`). Lowercased before use. If omitted, a random 10-character local part is generated.",
+            "minLength": 1,
+            "maxLength": 64,
+            "pattern": "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$",
+            "examples": ["jane.doe"]
+          },
+          "domain": {
+            "type": ["string", "null"],
+            "description": "One of the server's configured domains (see `GET /api/domains`). Defaults to the first configured domain when omitted.",
+            "examples": ["example.com"]
+          }
+        }
+      },
+      "Mailbox": {
+        "type": "object",
+        "description": "A disposable inbox.",
+        "required": ["address", "domain", "created_at", "expires_at"],
+        "properties": {
+          "address": {
+            "type": "string",
+            "format": "email",
+            "description": "Full email address of the mailbox (lowercased).",
+            "examples": ["a1b2c3d4e5@example.com"]
+          },
+          "domain": {
+            "type": "string",
+            "description": "Domain portion of the address.",
+            "examples": ["example.com"]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the mailbox was created (UTC).",
+            "examples": ["2026-07-01T11:23:45.123456Z"]
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the mailbox expires and becomes eligible for purging (UTC).",
+            "examples": ["2026-07-01T12:23:45.123456Z"]
+          }
+        }
+      },
+      "MessageSummary": {
+        "type": "object",
+        "description": "Lightweight message representation used in inbox listings (no bodies or attachment metadata).",
+        "required": ["id", "mail_from", "subject", "received_at", "has_attachments"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Message identifier.",
+            "examples": ["550e8400-e29b-41d4-a716-446655440000"]
+          },
+          "mail_from": {
+            "type": "string",
+            "description": "SMTP envelope sender (MAIL FROM) of the message.",
+            "examples": ["billing@shop.test"]
+          },
+          "subject": {
+            "type": ["string", "null"],
+            "description": "Message subject, or null if the email had no Subject header.",
+            "examples": ["Invoice #1042"]
+          },
+          "received_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the server received and stored the message (UTC).",
+            "examples": ["2026-07-01T11:24:10.000000Z"]
+          },
+          "has_attachments": {
+            "type": "boolean",
+            "description": "True if the message has one or more attachments.",
+            "examples": [true]
+          }
+        }
+      },
+      "AttachmentMeta": {
+        "type": "object",
+        "description": "Attachment metadata returned alongside a full message. Download the bytes via the attachment endpoint.",
+        "required": ["id", "filename", "content_type", "size"],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Attachment identifier; use it in the download URL.",
+            "examples": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]
+          },
+          "filename": {
+            "type": ["string", "null"],
+            "description": "Original filename, or null if the part had none.",
+            "examples": ["invoice-1042.pdf"]
+          },
+          "content_type": {
+            "type": "string",
+            "description": "MIME type of the attachment as parsed from the message.",
+            "examples": ["application/pdf"]
+          },
+          "size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Size of the attachment content in bytes.",
+            "examples": [18240]
+          }
+        }
+      },
+      "StoredMessage": {
+        "type": "object",
+        "description": "A fully materialised message including bodies and attachment metadata.",
+        "required": [
+          "id",
+          "mailbox_address",
+          "mail_from",
+          "subject",
+          "message_date",
+          "text_body",
+          "html_body",
+          "raw_size",
+          "received_at",
+          "attachments"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Message identifier.",
+            "examples": ["550e8400-e29b-41d4-a716-446655440000"]
+          },
+          "mailbox_address": {
+            "type": "string",
+            "format": "email",
+            "description": "Address of the mailbox this message belongs to.",
+            "examples": ["a1b2c3d4e5@example.com"]
+          },
+          "mail_from": {
+            "type": "string",
+            "description": "SMTP envelope sender (MAIL FROM) of the message.",
+            "examples": ["billing@shop.test"]
+          },
+          "subject": {
+            "type": ["string", "null"],
+            "description": "Message subject, or null if absent.",
+            "examples": ["Invoice #1042"]
+          },
+          "message_date": {
+            "type": ["string", "null"],
+            "format": "date-time",
+            "description": "Date parsed from the message's Date header (UTC), or null if missing/unparseable.",
+            "examples": ["2026-07-01T11:24:05.000000Z"]
+          },
+          "text_body": {
+            "type": ["string", "null"],
+            "description": "Plain-text body, or null if the message had none.",
+            "examples": ["Thanks for your order. Your invoice is attached."]
+          },
+          "html_body": {
+            "type": ["string", "null"],
+            "description": "HTML body, or null if the message had none.",
+            "examples": ["<p>Thanks for your order. Your invoice is attached.</p>"]
+          },
+          "raw_size": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Size in bytes of the raw message as received over SMTP (DATA phase).",
+            "examples": [20841]
+          },
+          "received_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the server received and stored the message (UTC).",
+            "examples": ["2026-07-01T11:24:10.000000Z"]
+          },
+          "attachments": {
+            "type": "array",
+            "description": "Attachment metadata (bytes downloaded separately). Empty when there are none.",
+            "items": { "$ref": "#/components/schemas/AttachmentMeta" }
+          }
+        }
+      },
+      "MailEvent": {
+        "type": "object",
+        "description": "Payload delivered in the `data` field of each SSE `message` event. Mirrors a MessageSummary plus the target `address`, giving enough to render an inbox row immediately; treat the REST listing as authoritative.",
+        "required": ["address", "id", "mail_from", "subject", "received_at", "has_attachments"],
+        "properties": {
+          "address": {
+            "type": "string",
+            "format": "email",
+            "description": "The mailbox address the message arrived for.",
+            "examples": ["a1b2c3d4e5@example.com"]
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "Identifier of the newly stored message.",
+            "examples": ["550e8400-e29b-41d4-a716-446655440000"]
+          },
+          "mail_from": {
+            "type": "string",
+            "description": "SMTP envelope sender (MAIL FROM) of the message.",
+            "examples": ["billing@shop.test"]
+          },
+          "subject": {
+            "type": ["string", "null"],
+            "description": "Message subject, or null if absent.",
+            "examples": ["Invoice #1042"]
+          },
+          "received_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the server received and stored the message (UTC).",
+            "examples": ["2026-07-01T11:24:10.000000Z"]
+          },
+          "has_attachments": {
+            "type": "boolean",
+            "description": "True if the message has one or more attachments.",
+            "examples": [true]
+          }
+        }
+      },
+      "DomainsResponse": {
+        "type": "object",
+        "description": "The set of domains the server accepts mail for.",
+        "required": ["domains"],
+        "properties": {
+          "domains": {
+            "type": "array",
+            "description": "Configured domains; the first is the default for address creation.",
+            "items": { "type": "string" },
+            "examples": [["example.com"]]
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "description": "Health-check payload.",
+        "required": ["status"],
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "Always `\"ok\"` when the server is healthy.",
+            "examples": ["ok"]
+          }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "description": "Uniform error envelope returned on any non-2xx response.",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Human-readable error message.",
+            "examples": ["mailbox not found"]
+          }
+        }
+      }
+    }
+  }
+}
