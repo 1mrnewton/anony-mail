@@ -3,9 +3,11 @@ FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /app
 
-# build-essential provides the C toolchain needed by the `ring` crypto crate.
+# build-essential provides the C toolchain needed by the `ring` crypto crate;
+# pkg-config + libssl-dev are required by openssl-sys (web-push's payload
+# encryption via the `ece` crate links against OpenSSL).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential \
+    && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
@@ -25,8 +27,10 @@ LABEL org.opencontainers.image.source="https://github.com/1mrnewton/anony-mail" 
       org.opencontainers.image.description="Inbound-only disposable email (temp mail) backend: SMTP in, REST + SSE out." \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
+# libssl3 is the OpenSSL runtime the binary links against (web-push payload
+# encryption); bookworm-slim does not include it.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Run as a dedicated non-root user: a compromised process can't touch the
