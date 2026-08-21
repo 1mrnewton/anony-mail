@@ -8,11 +8,20 @@ frontend over a REST + Server-Sent-Events HTTP API. It does not send mail.
   RSET, NOOP, QUIT, VRFY, HELP, optional STARTTLS).
 - Recipients are validated at `RCPT TO` against the database, so mail to unknown
   or expired addresses is rejected at the SMTP layer instead of being stored.
+  Plus-addressing (`user+tag@`) delivers to the base mailbox; an opt-in
+  catch-all can auto-create mailboxes for unknown local parts.
 - MIME parsing via [`mail-parser`](https://crates.io/crates/mail-parser)
-  (subject, from, date, text/html bodies, attachments).
-- REST API for creating addresses and reading messages, plus an SSE stream that
-  pushes a lightweight event the moment a message arrives.
-- Background task purges expired mailboxes (messages/attachments cascade).
+  (subject, from, date, text/html bodies, attachments), with server-side
+  verification-code (OTP) extraction surfaced on SSE and push events.
+- REST API for creating addresses and reading messages, plus an SSE stream and
+  optional **Web Push (VAPID)** notifications the moment a message arrives.
+- Destructive/lifecycle operations (extend, delete, clear, subscribe) are
+  gated by a per-mailbox **owner token** returned once at creation.
+- Abuse controls throughout: per-IP rate limits and daily creation quotas,
+  request timeouts, SSE concurrency caps, per-mailbox message/byte quotas
+  (drop-oldest), reserved local parts, and a disk watermark for SQLite.
+- Background task purges expired mailboxes (messages/attachments cascade) and
+  reclaims SQLite space incrementally.
 - Pluggable storage behind a `Store` trait: **SQLite by default** (zero external
   dependencies), or PostgreSQL by setting a `postgres://` `DATABASE_URL`.
 
@@ -68,7 +77,8 @@ Then create an address and watch for mail:
 ```bash
 # Create a random disposable address
 curl -s -X POST http://localhost:8080/api/addresses | jq
-# => { "address": "a1b2c3d4e5@example.com", "domain": "example.com", ... }
+# => { "address": "a1b2c3d4e5@example.com", "domain": "example.com",
+#      "owner_token": "am_...", ... }   <- store it; shown only here and on rotate
 
 # List its messages (empty until mail arrives)
 curl -s http://localhost:8080/api/addresses/a1b2c3d4e5@example.com/messages | jq
@@ -108,18 +118,37 @@ Only `DOMAINS` is required; everything else has defaults.
 | --- | --- | --- |
 | `DOMAINS` | — (required) | Comma-separated domains to accept mail for |
 | `DATABASE_URL` | `sqlite://data/anony-mail.db` | DB connection string: `sqlite://<path>` or `postgres://…` |
-| `SMTP_BIND_ADDR` | `0.0.0.0:25` | SMTP listener address |
+| `DB_MAX_CONNECTIONS` | `0` | DB pool size; `0` = backend default (Postgres 10, SQLite 5) |
+| `SMTP_BIND_ADDR` | `0.0.0.0:25` | SMTP listener address (`0.0.0.0:2525` in the Docker image) |
 | `API_BIND_ADDR` | `0.0.0.0:8080` | HTTP API listener address |
 | `SMTP_HOSTNAME` | first domain | Hostname announced in the SMTP banner/EHLO |
 | `DEFAULT_TTL_SECONDS` | `3600` | Mailbox lifetime |
-| `CLEANUP_INTERVAL_SECONDS` | `300` | Expiry purge interval |
+| `CLEANUP_INTERVAL_SECONDS` | `300` | Expiry purge + maintenance interval |
 | `MAX_MESSAGE_SIZE_BYTES` | `26214400` | Max accepted message size (25 MiB) |
-| `MAX_RECIPIENTS` | `100` | Max recipients per SMTP transaction |
+| `MAX_RECIPIENTS` | `10` | Max recipients per SMTP transaction |
 | `MAX_CONNECTIONS` | `1024` | Max concurrent SMTP connections |
 | `SMTP_SESSION_TIMEOUT_SECONDS` | `60` | Per-connection idle timeout |
-| `SMTP_PER_IP_CONNECTIONS_PER_MIN` | `60` | Per-IP new-connection rate limit |
+| `SMTP_PER_IP_CONNECTIONS_PER_MIN` | `60` | Per-IP new-SMTP-connection rate limit |
 | `TLS_CERT_PATH` / `TLS_KEY_PATH` | unset | Enable STARTTLS (PEM files) |
 | `CORS_ALLOWED_ORIGINS` | `*` | Comma-separated CORS origins, or `*` |
+| `RESERVED_LOCAL_PARTS` | unset | Extra local parts to refuse, on top of the built-in list |
+| `API_RATE_LIMIT_PER_SECOND` | `20` | General per-IP API rate (req/s, `0` disables) |
+| `API_RATE_LIMIT_BURST` | `50` | Burst budget for the general limit |
+| `API_CREATE_RATE_LIMIT_PER_MINUTE` | `30` | Per-IP `POST /api/addresses` rate (`0` disables) |
+| `API_CREATE_RATE_LIMIT_BURST` | `10` | Burst budget for address creation |
+| `MAX_ADDRESSES_PER_IP_PER_DAY` | `200` | Per-IP daily creation quota (`0` disables) |
+| `API_REQUEST_TIMEOUT_SECONDS` | `30` | Timeout on non-SSE routes (`0` disables) |
+| `API_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` etc. (only behind a proxy) |
+| `SSE_MAX_CONCURRENT` | `512` | Global cap on open SSE streams (`0` disables) |
+| `SSE_MAX_PER_IP` | `8` | Per-IP cap on open SSE streams (`0` disables) |
+| `MAX_MESSAGES_PER_MAILBOX` | `50` | Per-mailbox message cap, drop-oldest (`0` disables) |
+| `MAX_MAILBOX_BYTES` | `41943040` | Per-mailbox byte cap (40 MiB), drop-oldest (`0` disables) |
+| `MIN_FREE_DISK_BYTES` | `268435456` | Refuse `DATA` below this free space (256 MiB; SQLite; `0` disables) |
+| `CATCH_ALL_ENABLED` | `false` | Auto-create mailboxes for unknown local parts |
+| `STORE_RAW_MESSAGE` | `false` | Retain original bytes; serves `GET …/messages/{id}/raw` |
+| `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | unset | Enable Web Push (both required) |
+| `VAPID_SUBJECT` | `mailto:postmaster@<first domain>` | VAPID contact (`mailto:` or URL) |
+| `MAX_SUBSCRIPTIONS_PER_MAILBOX` | `5` | Push subscriptions per mailbox (`0` disables cap) |
 | `RUST_LOG` | `info` | `tracing` env-filter directive |
 
 ## Storage backends
@@ -153,24 +182,39 @@ Data then survives restarts and redeploys for as long as the volume exists
 mailboxes expire (`DEFAULT_TTL_SECONDS`) and are purged, persistence here means
 surviving restarts — not retaining mail indefinitely.
 
+> **Upgrading an existing deployment:** the image now runs as a non-root user
+> (UID/GID `10001`). A `maildata` volume created by an older root-running image
+> is owned by root, so fix its ownership once before starting the new version:
+> `docker run --rm -v <project>_maildata:/data alpine chown -R 10001:10001 /data`.
+
 ## HTTP API
 
 Base path `/api`. Request/response bodies are JSON. Errors are
-`{ "error": "message" }` with an appropriate status code.
+`{ "error": "message" }` with an appropriate status code. The full contract
+lives in [openapi.json](openapi.json). Rows marked **owner** require the
+mailbox's owner token as `Authorization: Bearer am_…`.
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/healthz` | Health check |
-| `GET` | `/api/domains` | List configured domains |
-| `POST` | `/api/addresses` | Create an address (see below) |
-| `GET` | `/api/addresses/{address}` | Mailbox info / existence check |
-| `POST` | `/api/addresses/{address}/extend` | Extend expiry by the default TTL |
-| `DELETE` | `/api/addresses/{address}` | Delete mailbox + all messages |
-| `GET` | `/api/addresses/{address}/messages` | List message summaries (newest first) |
-| `GET` | `/api/addresses/{address}/messages/{id}` | Full message (bodies + attachment metadata) |
-| `GET` | `/api/addresses/{address}/messages/{id}/attachments/{attachment_id}` | Download raw attachment bytes |
-| `DELETE` | `/api/addresses/{address}/messages/{id}` | Delete one message |
-| `GET` | `/api/addresses/{address}/events` | SSE stream of new-message events |
+| Method | Path | Auth | Description |
+| --- | --- | --- | --- |
+| `GET` | `/healthz` | — | Liveness check |
+| `GET` | `/readyz` | — | Readiness check (pings the database) |
+| `GET` | `/api/domains` | — | List configured domains |
+| `POST` | `/api/addresses` | — | Create an address (see below) |
+| `GET` | `/api/addresses/{address}` | — | Mailbox info / existence check |
+| `POST` | `/api/addresses/{address}/extend` | owner | Extend expiry by the default TTL |
+| `POST` | `/api/addresses/{address}/rotate` | owner | Rotate the owner token (returns the new one) |
+| `DELETE` | `/api/addresses/{address}` | owner | Delete mailbox + all messages |
+| `GET` | `/api/addresses/{address}/messages` | — | List summaries, newest first (`?limit=`, `?since=`) |
+| `GET` | `/api/addresses/{address}/messages/{id}` | — | Full message (bodies + attachment metadata) |
+| `GET` | `/api/addresses/{address}/messages/{id}/raw` | — | Original `.eml` (only if `STORE_RAW_MESSAGE=true`) |
+| `GET` | `/api/addresses/{address}/messages/{id}/attachments/{attachment_id}` | — | Download attachment bytes |
+| `POST` | `/api/addresses/{address}/messages/{id}/read` | — | Mark a message as seen |
+| `DELETE` | `/api/addresses/{address}/messages/{id}` | owner | Delete one message |
+| `DELETE` | `/api/addresses/{address}/messages` | owner | Clear the inbox (mailbox survives) |
+| `GET` | `/api/addresses/{address}/events` | — | SSE stream of new-message events |
+| `GET` | `/api/push/vapid-public-key` | — | VAPID public key (`503` if push not configured) |
+| `POST` | `/api/addresses/{address}/subscriptions` | owner | Register a Web Push subscription |
+| `DELETE` | `/api/addresses/{address}/subscriptions` | owner | Remove a Web Push subscription |
 
 ### Create an address
 
@@ -183,9 +227,37 @@ Base path `/api`. Request/response bodies are JSON. Errors are
 - Both fields are optional. Omit the body entirely for a random address on the
   first configured domain.
 - `local_part` must be 1–64 chars of `[a-z0-9._-]` and not start/end with a
-  separator. A taken custom address returns `409 Conflict`.
+  separator. A taken custom address returns `409 Conflict`; reserved names
+  (`admin`, `postmaster`, `webmaster`, … plus `RESERVED_LOCAL_PARTS`) return
+  `400`.
+- Rate-limited per IP (`API_CREATE_RATE_LIMIT_PER_MINUTE`,
+  `MAX_ADDRESSES_PER_IP_PER_DAY`) — expect `429` under abuse.
 
-Returns `201 Created` with the mailbox `{ address, domain, created_at, expires_at }`.
+Returns `201 Created` with the mailbox fields plus a one-time secret:
+
+```json
+{
+  "address": "a1b2c3d4e5@example.com",
+  "domain": "example.com",
+  "created_at": "…",
+  "expires_at": "…",
+  "owner_token": "am_…"
+}
+```
+
+### Owner tokens
+
+The `owner_token` is the only credential for destructive and lifecycle
+operations (extend, rotate, delete mailbox/message, clear inbox, push
+subscriptions). It is shown **only** in the create and rotate responses — the
+server stores just a SHA-256 hash, so it cannot be recovered later. Send it as
+`Authorization: Bearer am_…`; a missing or wrong token yields `401`. Reading
+mail stays tokenless: anyone who knows the address can poll the inbox, which is
+the normal temp-mail model. If a token leaks, `POST …/rotate` (authenticated
+with the current token) invalidates it and returns a fresh one. Mailboxes with
+no token on record — created before this feature, or auto-created by the
+catch-all — can never pass owner-gated calls (`401`); they simply age out and
+expire.
 
 ### Live updates (SSE)
 
@@ -194,21 +266,60 @@ const es = new EventSource(
   `/api/addresses/${encodeURIComponent(address)}/events`
 );
 es.addEventListener("message", (e) => {
-  const evt = JSON.parse(e.data); // { address, id, mail_from, subject, received_at, has_attachments }
-  // fetch the full message, or refresh the inbox listing
+  // { address, id, mail_from, subject, received_at, has_attachments, code }
+  const evt = JSON.parse(e.data);
+  // `code` is a best-effort verification code (OTP) extracted server-side,
+  // or null. Fetch the full message, or refresh the inbox listing.
 });
 ```
 
 On reconnect, always re-fetch the message list — SSE events may be missed while
-disconnected and are not replayed.
+disconnected and are not replayed. Streams are capped globally and per IP
+(`SSE_MAX_CONCURRENT`, `SSE_MAX_PER_IP`); a `429` means too many are open.
+
+### Web Push
+
+With `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY` set, browsers can get native push
+notifications instead of holding an SSE stream open:
+
+1. `GET /api/push/vapid-public-key` → use as `applicationServerKey` in
+   `pushManager.subscribe()`.
+2. `POST /api/addresses/{address}/subscriptions` (owner token) with the
+   subscription's `{ endpoint, keys: { p256dh, auth } }` → `201`.
+3. New mail triggers an encrypted push with
+   `{ address, id, from, subject, code }`; expired/revoked endpoints
+   (`404`/`410` from the push service) are pruned automatically.
+4. `DELETE …/subscriptions` with `{ "endpoint": … }` removes one → `204`.
+
+Each mailbox holds at most `MAX_SUBSCRIPTIONS_PER_MAILBOX` subscriptions, and
+subscriptions die with the mailbox.
+
+### Attachment & HTML safety
+
+- `html_body` is returned **as-is** (untrusted). Render it sandboxed — an
+  `<iframe sandbox>` or equivalent — never with script access to your origin.
+- Attachment downloads always carry `X-Content-Type-Options: nosniff` and
+  `Content-Disposition: attachment`; active types (`text/html`,
+  `image/svg+xml`, XML, JS) are served as `application/octet-stream` so
+  browsers download rather than execute them.
 
 ## SMTP behaviour
 
 - `RCPT TO` is accepted (`250`) only when the domain is one of `DOMAINS` **and**
   the mailbox exists and is unexpired. Otherwise `550` (unknown/relay) so the
   sending MTA gets a real bounce.
+- **Plus-addressing:** `user+anything@domain` delivers to `user@domain`; the
+  tag is stripped before the mailbox lookup.
+- **Catch-all (opt-in):** with `CATCH_ALL_ENABLED=true`, mail to an unknown
+  local part on an accepted domain auto-creates a default-TTL mailbox — except
+  for reserved local parts, which are still rejected.
 - `DATA` is capped at `MAX_MESSAGE_SIZE_BYTES`; oversize messages are drained to
-  the terminator and rejected with `552`.
+  the terminator and rejected with `552`. On the SQLite backend, `DATA` is
+  refused with `452` (transient, sender retries) when free disk space falls
+  below `MIN_FREE_DISK_BYTES`.
+- Per-mailbox quotas apply at save time: beyond `MAX_MESSAGES_PER_MAILBOX` or
+  `MAX_MAILBOX_BYTES` the **oldest** messages are dropped, so the newest mail
+  (usually the OTP you are waiting for) always lands.
 - Dot-stuffing/unstuffing and the `<CRLF>.<CRLF>` terminator are handled.
 - STARTTLS is advertised only when a certificate is configured; the session
   discards buffered plaintext on upgrade (RFC 3207).
@@ -219,10 +330,21 @@ disconnected and are not replayed.
 
 - **MX record:** point an MX record for each domain in `DOMAINS` at this
   server's public IP so other mail servers deliver here.
-- **Port 25:** binding it needs root or `CAP_NET_BIND_SERVICE`
-  (`setcap 'cap_net_bind_service=+ep' ./anony-mail`, or run in a container
-  as root). This server only needs **inbound** 25 — the common cloud port-25
-  block applies to *outbound* sending and does not affect receiving.
+- **Port 25:** the Docker image runs as a non-root user and listens on **2525**
+  in-container; the compose file publishes it as host port 25 (`"25:2525"`),
+  which is all production needs. When running the bare binary, binding 25
+  directly needs root or `CAP_NET_BIND_SERVICE`
+  (`setcap 'cap_net_bind_service=+ep' ./anony-mail`). To bind 25 inside the
+  container instead, grant the capability and override the address:
+  `docker run --cap-add NET_BIND_SERVICE --sysctl net.ipv4.ip_unprivileged_port_start=0 -e SMTP_BIND_ADDR=0.0.0.0:25 …`.
+  This server only needs **inbound** 25 — the common cloud port-25 block
+  applies to *outbound* sending and does not affect receiving.
+- **Reverse proxy:** if the HTTP API sits behind nginx/Caddy/a load balancer,
+  set `API_TRUST_PROXY_HEADERS=true` so rate limits and SSE caps key on the
+  real client IP from `X-Forwarded-For`. Leave it `false` when clients connect
+  directly, or IPs could be spoofed.
+- **Probes:** wire liveness to `GET /healthz` and readiness to `GET /readyz`
+  (the latter pings the database and returns `503` while it is unreachable).
 - **TLS:** set `TLS_CERT_PATH`/`TLS_KEY_PATH` to advertise STARTTLS. Senders
   fall back to plaintext when it is not offered, so it is optional but
   recommended.
@@ -278,9 +400,19 @@ image locally without pushing (handy for testing or building from source).
 cargo test
 ```
 
-Includes unit tests (SMTP command parsing, MIME extraction, address validation)
-and an end-to-end test that scripts a real SMTP conversation over a socket and
-reads the message back — using the in-memory store, so no database is required.
+The suite covers several layers, none of which need an external database:
+
+- Unit tests: SMTP command parsing, MIME extraction, address validation, OTP
+  patterns, token generation/parsing, attachment header hardening.
+- A store conformance suite (`tests/store_conformance.rs`) running one shared
+  set of tests — lifecycle, quotas, tokens, subscriptions, pagination, purge
+  cascades — against both the in-memory store and a temp-file SQLite store.
+- Handler/router tests exercising the HTTP surface in-process, including auth
+  failures, pagination, and download header hardening.
+- End-to-end SMTP tests that script real socket conversations (delivery,
+  plus-addressing, catch-all, oversize, dot-stuffing).
+- A drift test asserting `openapi.json` matches the crate version and that
+  every router path is documented in the spec.
 
 ## Project layout
 
@@ -289,15 +421,17 @@ src/
   main.rs            thin binary -> anony_mail::run()
   lib.rs             wiring: config, DB pool/backend, migrations, task startup
   config.rs          env-based configuration
-  model.rs           Mailbox, StoredMessage, Attachment, ...
-  events.rs          broadcast event bus for SSE
+  model.rs           Mailbox, StoredMessage, Attachment, PushSubscription, ...
+  events.rs          broadcast event bus for SSE + push
   mime.rs            mail-parser -> NewMessage
-  cleanup.rs         expired-mailbox purge task
+  otp.rs             verification-code extraction for the `code` event field
+  push.rs            Web Push worker: VAPID sends, stale-subscription pruning
+  cleanup.rs         expired-mailbox purge + store maintenance task
   store/             Store trait + SQLite, Postgres, and in-memory backends
   smtp/              accept loop, session state machine, commands, STARTTLS
-  api/               Axum router, address/message handlers, SSE
+  api/               Axum router, handlers, auth, SSE, push, rate limits
 migrations/          per-backend SQL migrations: sqlite/, postgres/
-tests/               end-to-end SMTP delivery test
+tests/               conformance, handler, SMTP e2e, push worker, spec drift
 ```
 
 ## License

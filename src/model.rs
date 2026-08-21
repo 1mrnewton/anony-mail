@@ -9,6 +9,10 @@ pub struct Mailbox {
     pub domain: String,
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    /// SHA-256 hex of the owner bearer token (A2). Never serialized; the raw
+    /// token is returned exactly once, from create/rotate responses.
+    #[serde(skip)]
+    pub owner_token_hash: Option<String>,
 }
 
 /// Lightweight message representation for inbox listings (no bodies).
@@ -19,6 +23,8 @@ pub struct MessageSummary {
     pub subject: Option<String>,
     pub received_at: DateTime<Utc>,
     pub has_attachments: bool,
+    /// U3: true once the client marked the message read.
+    pub seen: bool,
 }
 
 /// Attachment metadata returned alongside a full message (content omitted).
@@ -42,6 +48,8 @@ pub struct StoredMessage {
     pub html_body: Option<String>,
     pub raw_size: i32,
     pub received_at: DateTime<Utc>,
+    /// U3: true once the client marked the message read.
+    pub seen: bool,
     pub attachments: Vec<AttachmentMeta>,
 }
 
@@ -63,6 +71,10 @@ pub struct NewMessage {
     pub text_body: Option<String>,
     pub html_body: Option<String>,
     pub raw_size: i32,
+    /// U2: the original RFC 5322 bytes, retained only when
+    /// `STORE_RAW_MESSAGE` is enabled (the SMTP session sets this; the parser
+    /// leaves it `None`). Served via `GET .../messages/{id}/raw`.
+    pub raw_content: Option<Vec<u8>>,
     pub attachments: Vec<NewAttachment>,
 }
 
@@ -72,4 +84,18 @@ pub struct NewAttachment {
     pub filename: Option<String>,
     pub content_type: String,
     pub content: Vec<u8>,
+}
+
+/// A Web Push subscription registered for a mailbox (docs/06). Internal only —
+/// the endpoint and keys are client credentials and are never serialized out.
+#[derive(Debug, Clone)]
+pub struct PushSubscription {
+    pub id: Uuid,
+    pub mailbox_address: String,
+    pub endpoint: String,
+    /// Client public key (base64url), from `PushSubscription.getKey('p256dh')`.
+    pub p256dh: String,
+    /// Client auth secret (base64url), from `PushSubscription.getKey('auth')`.
+    pub auth: String,
+    pub created_at: DateTime<Utc>,
 }

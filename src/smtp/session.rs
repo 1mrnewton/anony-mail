@@ -65,7 +65,8 @@ enum LineStatus {
 }
 
 enum RecipientCheck {
-    Accept,
+    /// Deliver to this address (plus-tags already stripped, U1).
+    Accept(String),
     NotOurDomain,
     NoMailbox,
     Error,
@@ -129,6 +130,12 @@ impl Session {
                         write_line(&mut stream, "503 5.5.1 Need MAIL before DATA").await?;
                     } else if self.rcpts.is_empty() {
                         write_line(&mut stream, "554 5.5.1 No valid recipients").await?;
+                    } else if !storage_has_headroom(&self.ctx.config) {
+                        // A4: stop accepting mail before the disk actually
+                        // fills; a full volume corrupts far more than one
+                        // message. 452 invites the sender to retry later.
+                        warn!(peer = %self.peer, "refusing DATA: free disk below watermark");
+                        write_line(&mut stream, "452 4.3.1 Insufficient system storage").await?;
                     } else {
                         write_line(&mut stream, "354 Start mail input; end with <CRLF>.<CRLF>")
                             .await?;
@@ -252,9 +259,9 @@ impl Session {
 
         let recipient = addr.trim().to_ascii_lowercase();
         match self.validate_recipient(&recipient).await {
-            RecipientCheck::Accept => {
-                if !self.rcpts.contains(&recipient) {
-                    self.rcpts.push(recipient);
+            RecipientCheck::Accept(delivery) => {
+                if !self.rcpts.contains(&delivery) {
+                    self.rcpts.push(delivery);
                 }
                 write_line(w, "250 2.1.5 Recipient OK").await
             }
@@ -275,11 +282,71 @@ impl Session {
         if domain.is_empty() || !self.ctx.config.accepts_domain(domain) {
             return RecipientCheck::NotOurDomain;
         }
-        match self.ctx.store.mailbox_is_active(addr, Utc::now()).await {
-            Ok(true) => RecipientCheck::Accept,
-            Ok(false) => RecipientCheck::NoMailbox,
+
+        // U1 plus-addressing: `user+tag@` delivers to `user@`.
+        let delivery = strip_plus_tag(addr);
+        match self
+            .ctx
+            .store
+            .mailbox_is_active(&delivery, Utc::now())
+            .await
+        {
+            Ok(true) => RecipientCheck::Accept(delivery),
+            Ok(false) => self.try_catch_all(delivery).await,
             Err(e) => {
-                warn!(error = %e, address = %addr, "mailbox lookup failed");
+                warn!(error = %e, address = %delivery, "mailbox lookup failed");
+                RecipientCheck::Error
+            }
+        }
+    }
+
+    /// U1 catch-all: when enabled, auto-create a default-TTL mailbox for an
+    /// unknown local part — but never a reserved one (A1), else inbound mail
+    /// could conjure `admin@` into existence.
+    async fn try_catch_all(&self, delivery: String) -> RecipientCheck {
+        if !self.ctx.config.catch_all_enabled {
+            return RecipientCheck::NoMailbox;
+        }
+        let Some((local, domain)) = delivery.rsplit_once('@') else {
+            return RecipientCheck::NoMailbox;
+        };
+        if self.ctx.config.is_reserved_local_part(local) {
+            return RecipientCheck::NoMailbox;
+        }
+
+        let ttl = chrono::Duration::seconds(self.ctx.config.default_ttl.as_secs() as i64);
+        // Ownerless (no token): nobody can claim destructive control of a
+        // mailbox conjured by inbound mail.
+        match self
+            .ctx
+            .store
+            .create_mailbox(&delivery, domain, Utc::now() + ttl, None)
+            .await
+        {
+            Ok(_) => {
+                info!(address = %delivery, "catch-all created mailbox");
+                RecipientCheck::Accept(delivery)
+            }
+            Err(e) if crate::api::is_unique_violation(&e) => {
+                // The row exists but wasn't active: either an expired mailbox
+                // (refuse: expired means gone) or a concurrent create won the
+                // race (re-check and accept).
+                match self
+                    .ctx
+                    .store
+                    .mailbox_is_active(&delivery, Utc::now())
+                    .await
+                {
+                    Ok(true) => RecipientCheck::Accept(delivery),
+                    Ok(false) => RecipientCheck::NoMailbox,
+                    Err(e) => {
+                        warn!(error = %e, address = %delivery, "mailbox re-check failed");
+                        RecipientCheck::Error
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, address = %delivery, "catch-all create failed");
                 RecipientCheck::Error
             }
         }
@@ -337,7 +404,12 @@ impl Session {
     /// publishing an SSE event per stored copy. Returns the recipient count.
     async fn store_message(&self, raw: &[u8]) -> anyhow::Result<usize> {
         let envelope_from = self.mail_from.clone().unwrap_or_default();
-        let parsed = mime::parse_message(raw, &envelope_from);
+        let mut parsed = mime::parse_message(raw, &envelope_from);
+        // U2: keep the original bytes only when configured; roughly doubles
+        // per-message storage, and the A4 quota already counts raw_size.
+        if self.ctx.config.store_raw_message {
+            parsed.raw_content = Some(raw.to_vec());
+        }
 
         for rcpt in &self.rcpts {
             let stored = self.ctx.store.save_message(rcpt, parsed.clone()).await?;
@@ -444,6 +516,43 @@ async fn write_multiline<W: AsyncWrite + Unpin>(
     w.flush().await
 }
 
+/// A4 disk watermark: false when the SQLite data volume's available space is
+/// below `MIN_FREE_DISK_BYTES`. Postgres deployments (remote disk) and stat
+/// failures return true — accepting mail beats bouncing it on a stat error.
+fn storage_has_headroom(config: &Config) -> bool {
+    if config.min_free_disk_bytes == 0 {
+        return true;
+    }
+    let Some(db_path) = config.sqlite_path() else {
+        return true;
+    };
+    let path = std::path::Path::new(&db_path);
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => std::path::Path::new("."),
+    };
+    match fs4::available_space(dir) {
+        Ok(free) => free >= config.min_free_disk_bytes,
+        Err(e) => {
+            warn!(error = %e, dir = %dir.display(), "could not stat free disk space");
+            true
+        }
+    }
+}
+
+/// U1 plus-addressing: strip `+tag` from the local part (`user+shop@d` →
+/// `user@d`). A leading `+` is left untouched — stripping it would produce an
+/// empty local part.
+fn strip_plus_tag(addr: &str) -> String {
+    let Some((local, domain)) = addr.rsplit_once('@') else {
+        return addr.to_string();
+    };
+    match local.find('+') {
+        Some(pos) if pos > 0 => format!("{}@{}", &local[..pos], domain),
+        _ => addr.to_string(),
+    }
+}
+
 /// True if `line` is the SMTP end-of-data terminator (a lone `.`).
 fn is_terminator(line: &[u8]) -> bool {
     strip_eol(line) == b"."
@@ -479,5 +588,14 @@ mod tests {
         assert!(is_terminator(b"."));
         assert!(!is_terminator(b"..\r\n"));
         assert!(!is_terminator(b". \r\n"));
+    }
+
+    #[test]
+    fn plus_tags_are_stripped() {
+        assert_eq!(strip_plus_tag("user+shop@d.test"), "user@d.test");
+        assert_eq!(strip_plus_tag("user+a+b@d.test"), "user@d.test");
+        assert_eq!(strip_plus_tag("user@d.test"), "user@d.test");
+        assert_eq!(strip_plus_tag("+odd@d.test"), "+odd@d.test");
+        assert_eq!(strip_plus_tag("no-at-sign"), "no-at-sign");
     }
 }

@@ -20,6 +20,7 @@ pub fn parse_message(raw: &[u8], envelope_from: &str) -> NewMessage {
             text_body: None,
             html_body: None,
             raw_size,
+            raw_content: None,
             attachments: Vec::new(),
         };
     };
@@ -68,6 +69,7 @@ pub fn parse_message(raw: &[u8], envelope_from: &str) -> NewMessage {
         text_body,
         html_body,
         raw_size,
+        raw_content: None,
         attachments,
     }
 }

@@ -23,9 +23,11 @@ services:
     volumes:
       - maildata:/data
     ports:
-      # Left side is the host port. Inbound SMTP must be reachable on 25 in
-      # production; use e.g. "2525:25" locally if host port 25 is taken.
-      - "25:25"
+      # Left side is the host port. The container runs as a non-root user and
+      # listens on 2525; Docker's proxy makes it reachable on host port 25,
+      # where inbound SMTP must arrive in production. Use e.g. "2525:2525"
+      # locally if host port 25 is taken or privileged.
+      - "25:2525"
       - "8080:8080"
 
   # Optional PostgreSQL backend. Only started when the `postgres` profile is

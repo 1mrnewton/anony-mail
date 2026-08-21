@@ -18,6 +18,10 @@ pub struct MailEvent {
     pub subject: Option<String>,
     pub received_at: DateTime<Utc>,
     pub has_attachments: bool,
+    /// Server-extracted OTP / verification code (docs/05 §1), if one was
+    /// detected in the subject or text body. Rides along in both SSE events
+    /// and push payloads so clients can surface it without a fetch.
+    pub code: Option<String>,
 }
 
 impl MailEvent {
@@ -29,6 +33,7 @@ impl MailEvent {
             subject: msg.subject.clone(),
             received_at: msg.received_at,
             has_attachments: !msg.attachments.is_empty(),
+            code: crate::otp::extract(msg.subject.as_deref(), msg.text_body.as_deref()),
         }
     }
 }

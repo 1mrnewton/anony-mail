@@ -4,9 +4,10 @@ use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::Store;
+use super::{MailboxQuotas, Store, SubscriptionLimit};
 use crate::model::{
-    Attachment, AttachmentMeta, Mailbox, MessageSummary, NewMessage, StoredMessage,
+    Attachment, AttachmentMeta, Mailbox, MessageSummary, NewMessage, PushSubscription,
+    StoredMessage,
 };
 
 /// Postgres-backed [`Store`] implementation using `sqlx`.
@@ -16,11 +17,21 @@ use crate::model::{
 #[derive(Clone)]
 pub struct PostgresStore {
     pool: PgPool,
+    quotas: MailboxQuotas,
 }
 
 impl PostgresStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            quotas: MailboxQuotas::UNLIMITED,
+        }
+    }
+
+    /// Set the per-mailbox quotas enforced by `save_message`.
+    pub fn with_quotas(mut self, quotas: MailboxQuotas) -> Self {
+        self.quotas = quotas;
+        self
     }
 }
 
@@ -32,6 +43,7 @@ struct MailboxRow {
     domain: String,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
+    owner_token_hash: Option<String>,
 }
 
 impl From<MailboxRow> for Mailbox {
@@ -41,6 +53,7 @@ impl From<MailboxRow> for Mailbox {
             domain: r.domain,
             created_at: r.created_at,
             expires_at: r.expires_at,
+            owner_token_hash: r.owner_token_hash,
         }
     }
 }
@@ -52,6 +65,7 @@ struct SummaryRow {
     subject: Option<String>,
     received_at: DateTime<Utc>,
     has_attachments: bool,
+    seen: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -65,6 +79,7 @@ struct MessageRow {
     html_body: Option<String>,
     raw_size: i32,
     received_at: DateTime<Utc>,
+    seen: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -93,15 +108,17 @@ impl Store for PostgresStore {
         address: &str,
         domain: &str,
         expires_at: DateTime<Utc>,
+        owner_token_hash: Option<&str>,
     ) -> Result<Mailbox> {
         let row = sqlx::query_as::<_, MailboxRow>(
-            "INSERT INTO mailboxes (address, domain, expires_at)
-             VALUES ($1, $2, $3)
-             RETURNING address, domain, created_at, expires_at",
+            "INSERT INTO mailboxes (address, domain, expires_at, owner_token_hash)
+             VALUES ($1, $2, $3, $4)
+             RETURNING address, domain, created_at, expires_at, owner_token_hash",
         )
         .bind(address)
         .bind(domain)
         .bind(expires_at)
+        .bind(owner_token_hash)
         .fetch_one(&self.pool)
         .await?;
         Ok(row.into())
@@ -109,7 +126,7 @@ impl Store for PostgresStore {
 
     async fn get_mailbox(&self, address: &str) -> Result<Option<Mailbox>> {
         let row = sqlx::query_as::<_, MailboxRow>(
-            "SELECT address, domain, created_at, expires_at
+            "SELECT address, domain, created_at, expires_at, owner_token_hash
              FROM mailboxes WHERE address = $1",
         )
         .bind(address)
@@ -138,7 +155,7 @@ impl Store for PostgresStore {
     ) -> Result<Option<Mailbox>> {
         let row = sqlx::query_as::<_, MailboxRow>(
             "UPDATE mailboxes SET expires_at = $2 WHERE address = $1
-             RETURNING address, domain, created_at, expires_at",
+             RETURNING address, domain, created_at, expires_at, owner_token_hash",
         )
         .bind(address)
         .bind(new_expires_at)
@@ -155,14 +172,23 @@ impl Store for PostgresStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn rotate_owner_token(&self, address: &str, new_hash: &str) -> Result<bool> {
+        let res = sqlx::query("UPDATE mailboxes SET owner_token_hash = $2 WHERE address = $1")
+            .bind(address)
+            .bind(new_hash)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn save_message(&self, address: &str, message: NewMessage) -> Result<StoredMessage> {
         let mut tx = self.pool.begin().await?;
 
         let (id, received_at): (Uuid, DateTime<Utc>) = sqlx::query_as(
             "INSERT INTO messages
                  (mailbox_address, mail_from, subject, message_date,
-                  text_body, html_body, raw_size)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                  text_body, html_body, raw_size, raw_content)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
              RETURNING id, received_at",
         )
         .bind(address)
@@ -172,6 +198,7 @@ impl Store for PostgresStore {
         .bind(&message.text_body)
         .bind(&message.html_body)
         .bind(message.raw_size)
+        .bind(&message.raw_content)
         .fetch_one(&mut *tx)
         .await?;
 
@@ -199,6 +226,40 @@ impl Store for PostgresStore {
             });
         }
 
+        // A4 quotas: drop the oldest messages beyond the caps, atomically with
+        // the insert. `(received_at, id)` ordering matches the listing order.
+        if self.quotas.max_messages > 0 {
+            sqlx::query(
+                "DELETE FROM messages WHERE mailbox_address = $1 AND id NOT IN (
+                     SELECT id FROM messages WHERE mailbox_address = $1
+                     ORDER BY received_at DESC, id DESC LIMIT $2
+                 )",
+            )
+            .bind(address)
+            .bind(self.quotas.max_messages as i64)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if self.quotas.max_bytes > 0 {
+            // Keep the newest messages whose running total fits the budget;
+            // never drop the message just saved.
+            sqlx::query(
+                "DELETE FROM messages WHERE mailbox_address = $1 AND id IN (
+                     SELECT id FROM (
+                         SELECT id,
+                                SUM(raw_size) OVER (ORDER BY received_at DESC, id DESC)
+                                    AS running
+                         FROM messages WHERE mailbox_address = $1
+                     ) t WHERE t.running > $2 AND t.id <> $3
+                 )",
+            )
+            .bind(address)
+            .bind(self.quotas.max_bytes as i64)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
         tx.commit().await?;
 
         Ok(StoredMessage {
@@ -211,20 +272,37 @@ impl Store for PostgresStore {
             html_body: message.html_body,
             raw_size: message.raw_size,
             received_at,
+            seen: false,
             attachments,
         })
     }
 
-    async fn list_messages(&self, address: &str) -> Result<Vec<MessageSummary>> {
+    async fn list_messages(
+        &self,
+        address: &str,
+        limit: u32,
+        since: Option<Uuid>,
+    ) -> Result<Vec<MessageSummary>> {
+        // Keyset cursor resolved in-SQL (see the SQLite twin). `LIMIT NULL`
+        // means no limit in Postgres; a vanished anchor disables the filter.
         let rows = sqlx::query_as::<_, SummaryRow>(
-            "SELECT m.id, m.mail_from, m.subject, m.received_at,
+            "SELECT m.id, m.mail_from, m.subject, m.received_at, m.seen,
                     EXISTS(SELECT 1 FROM attachments a WHERE a.message_id = m.id)
                         AS has_attachments
              FROM messages m
              WHERE m.mailbox_address = $1
-             ORDER BY m.received_at DESC",
+               AND ($3 IS NULL
+                    OR NOT EXISTS(SELECT 1 FROM messages s
+                                  WHERE s.mailbox_address = $1 AND s.id = $3)
+                    OR (m.received_at, m.id) >
+                       (SELECT s.received_at, s.id FROM messages s
+                        WHERE s.mailbox_address = $1 AND s.id = $3))
+             ORDER BY m.received_at DESC, m.id DESC
+             LIMIT $2",
         )
         .bind(address)
+        .bind(if limit == 0 { None } else { Some(limit as i64) })
+        .bind(since)
         .fetch_all(&self.pool)
         .await?;
 
@@ -236,6 +314,7 @@ impl Store for PostgresStore {
                 subject: r.subject,
                 received_at: r.received_at,
                 has_attachments: r.has_attachments,
+                seen: r.seen,
             })
             .collect())
     }
@@ -243,7 +322,7 @@ impl Store for PostgresStore {
     async fn get_message(&self, address: &str, id: Uuid) -> Result<Option<StoredMessage>> {
         let row = sqlx::query_as::<_, MessageRow>(
             "SELECT id, mailbox_address, mail_from, subject, message_date,
-                    text_body, html_body, raw_size, received_at
+                    text_body, html_body, raw_size, received_at, seen
              FROM messages
              WHERE mailbox_address = $1 AND id = $2",
         )
@@ -277,8 +356,20 @@ impl Store for PostgresStore {
             html_body: row.html_body,
             raw_size: row.raw_size,
             received_at: row.received_at,
+            seen: row.seen,
             attachments,
         }))
+    }
+
+    async fn get_raw_message(&self, address: &str, id: Uuid) -> Result<Option<Vec<u8>>> {
+        let row: Option<(Option<Vec<u8>>,)> = sqlx::query_as(
+            "SELECT raw_content FROM messages WHERE mailbox_address = $1 AND id = $2",
+        )
+        .bind(address)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(raw,)| raw))
     }
 
     async fn get_attachment(
@@ -315,11 +406,122 @@ impl Store for PostgresStore {
         Ok(res.rows_affected() > 0)
     }
 
+    async fn mark_seen(&self, address: &str, id: Uuid) -> Result<bool> {
+        let res =
+            sqlx::query("UPDATE messages SET seen = TRUE WHERE mailbox_address = $1 AND id = $2")
+                .bind(address)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn delete_all_messages(&self, address: &str) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM messages WHERE mailbox_address = $1")
+            .bind(address)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     async fn purge_expired(&self, now: DateTime<Utc>) -> Result<u64> {
         let res = sqlx::query("DELETE FROM mailboxes WHERE expires_at <= $1")
             .bind(now)
             .execute(&self.pool)
             .await?;
         Ok(res.rows_affected())
+    }
+
+    async fn ping(&self) -> Result<()> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn add_subscription(
+        &self,
+        address: &str,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+        max_per_mailbox: u32,
+    ) -> Result<PushSubscription> {
+        let mut tx = self.pool.begin().await?;
+
+        // Cap check first; the upsert below refreshes existing rows without
+        // consuming quota (count only rows with a *different* endpoint).
+        if max_per_mailbox > 0 {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(*) FROM push_subscriptions
+                 WHERE mailbox_address = $1 AND endpoint <> $2",
+            )
+            .bind(address)
+            .bind(endpoint)
+            .fetch_one(&mut *tx)
+            .await?;
+            if count >= max_per_mailbox as i64 {
+                return Err(SubscriptionLimit(max_per_mailbox).into());
+            }
+        }
+
+        let row: PushSubscriptionRow = sqlx::query_as(
+            "INSERT INTO push_subscriptions (mailbox_address, endpoint, p256dh, auth)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (mailbox_address, endpoint)
+             DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth
+             RETURNING id, mailbox_address, endpoint, p256dh, auth, created_at",
+        )
+        .bind(address)
+        .bind(endpoint)
+        .bind(p256dh)
+        .bind(auth)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(row.into())
+    }
+
+    async fn list_subscriptions(&self, address: &str) -> Result<Vec<PushSubscription>> {
+        let rows: Vec<PushSubscriptionRow> = sqlx::query_as(
+            "SELECT id, mailbox_address, endpoint, p256dh, auth, created_at
+             FROM push_subscriptions WHERE mailbox_address = $1 ORDER BY created_at",
+        )
+        .bind(address)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn delete_subscription(&self, address: &str, endpoint: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "DELETE FROM push_subscriptions WHERE mailbox_address = $1 AND endpoint = $2",
+        )
+        .bind(address)
+        .bind(endpoint)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct PushSubscriptionRow {
+    id: Uuid,
+    mailbox_address: String,
+    endpoint: String,
+    p256dh: String,
+    auth: String,
+    created_at: DateTime<Utc>,
+}
+
+impl From<PushSubscriptionRow> for PushSubscription {
+    fn from(r: PushSubscriptionRow) -> Self {
+        PushSubscription {
+            id: r.id,
+            mailbox_address: r.mailbox_address,
+            endpoint: r.endpoint,
+            p256dh: r.p256dh,
+            auth: r.auth,
+            created_at: r.created_at,
+        }
     }
 }
