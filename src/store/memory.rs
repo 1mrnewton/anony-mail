@@ -9,7 +9,7 @@ use uuid::Uuid;
 use super::{MailboxQuotas, Store, SubscriptionLimit, UniqueViolation};
 use crate::model::{
     Attachment, AttachmentMeta, Mailbox, MessageSummary, NewMessage, PushSubscription,
-    StoredMessage,
+    StoredMessage, SubscriptionKind,
 };
 
 /// In-memory [`Store`], primarily for tests and local development without a
@@ -352,19 +352,21 @@ impl Store for MemoryStore {
     async fn add_subscription(
         &self,
         address: &str,
+        kind: SubscriptionKind,
         endpoint: &str,
         p256dh: &str,
         auth: &str,
         max_per_mailbox: u32,
     ) -> Result<PushSubscription> {
         let mut inner = self.inner.lock().unwrap();
-        // Upsert: refreshing an existing endpoint replaces its keys and does
-        // not count against the cap.
+        // Upsert: refreshing an existing endpoint replaces its kind and keys
+        // and does not count against the cap.
         if let Some(existing) = inner
             .subscriptions
             .iter_mut()
             .find(|s| s.mailbox_address == address && s.endpoint == endpoint)
         {
+            existing.kind = kind;
             existing.p256dh = p256dh.to_string();
             existing.auth = auth.to_string();
             return Ok(existing.clone());
@@ -380,6 +382,7 @@ impl Store for MemoryStore {
         let sub = PushSubscription {
             id: Uuid::new_v4(),
             mailbox_address: address.to_string(),
+            kind,
             endpoint: endpoint.to_string(),
             p256dh: p256dh.to_string(),
             auth: auth.to_string(),

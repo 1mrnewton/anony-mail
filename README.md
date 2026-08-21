@@ -14,7 +14,8 @@ frontend over a REST + Server-Sent-Events HTTP API. It does not send mail.
   (subject, from, date, text/html bodies, attachments), with server-side
   verification-code (OTP) extraction surfaced on SSE and push events.
 - REST API for creating addresses and reading messages, plus an SSE stream and
-  optional **Web Push (VAPID)** notifications the moment a message arrives.
+  optional push notifications — **Web Push (VAPID)** for browsers and **APNs**
+  for native iOS apps — the moment a message arrives.
 - Destructive/lifecycle operations (extend, delete, clear, subscribe) are
   gated by a per-mailbox **owner token** returned once at creation.
 - Abuse controls throughout: per-IP rate limits and daily creation quotas,
@@ -148,7 +149,10 @@ Only `DOMAINS` is required; everything else has defaults.
 | `STORE_RAW_MESSAGE` | `false` | Retain original bytes; serves `GET …/messages/{id}/raw` |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | unset | Enable Web Push (both required) |
 | `VAPID_SUBJECT` | `mailto:postmaster@<first domain>` | VAPID contact (`mailto:` or URL) |
-| `MAX_SUBSCRIPTIONS_PER_MAILBOX` | `5` | Push subscriptions per mailbox (`0` disables cap) |
+| `APNS_TEAM_ID` / `APNS_KEY_ID` / `APNS_TOPIC` | unset | Enable APNs / native iOS push (all + a key required) |
+| `APNS_KEY_PATH` or `APNS_KEY_BASE64` | unset | The `.p8` signing key: file path, or its base64 inline |
+| `APNS_SANDBOX` | `false` | Use Apple's sandbox gateway (Xcode debug builds only) |
+| `MAX_SUBSCRIPTIONS_PER_MAILBOX` | `5` | Push subscriptions per mailbox, all kinds (`0` disables cap) |
 | `RUST_LOG` | `info` | `tracing` env-filter directive |
 
 ## Storage backends
@@ -212,9 +216,10 @@ mailbox's owner token as `Authorization: Bearer am_…`.
 | `DELETE` | `/api/addresses/{address}/messages/{id}` | owner | Delete one message |
 | `DELETE` | `/api/addresses/{address}/messages` | owner | Clear the inbox (mailbox survives) |
 | `GET` | `/api/addresses/{address}/events` | — | SSE stream of new-message events |
-| `GET` | `/api/push/vapid-public-key` | — | VAPID public key (`503` if push not configured) |
-| `POST` | `/api/addresses/{address}/subscriptions` | owner | Register a Web Push subscription |
-| `DELETE` | `/api/addresses/{address}/subscriptions` | owner | Remove a Web Push subscription |
+| `GET` | `/api/push/config` | — | Which push channels are enabled (`webpush`, `apns`) |
+| `GET` | `/api/push/vapid-public-key` | — | VAPID public key (`503` if Web Push not configured) |
+| `POST` | `/api/addresses/{address}/subscriptions` | owner | Register a push subscription (Web Push or APNs) |
+| `DELETE` | `/api/addresses/{address}/subscriptions` | owner | Remove a push subscription (by endpoint or device token) |
 
 ### Create an address
 
@@ -277,10 +282,15 @@ On reconnect, always re-fetch the message list — SSE events may be missed whil
 disconnected and are not replayed. Streams are capped globally and per IP
 (`SSE_MAX_CONCURRENT`, `SSE_MAX_PER_IP`); a `429` means too many are open.
 
-### Web Push
+### Push notifications
 
-With `VAPID_PUBLIC_KEY`/`VAPID_PRIVATE_KEY` set, browsers can get native push
-notifications instead of holding an SSE stream open:
+Two optional channels share one subscription API; `GET /api/push/config`
+reports which are enabled. Each mailbox holds at most
+`MAX_SUBSCRIPTIONS_PER_MAILBOX` subscriptions (all kinds combined), and
+subscriptions die with the mailbox.
+
+**Web Push (browsers / PWAs)** — enabled by `VAPID_PUBLIC_KEY` +
+`VAPID_PRIVATE_KEY` (generate once with `npx web-push generate-vapid-keys`):
 
 1. `GET /api/push/vapid-public-key` → use as `applicationServerKey` in
    `pushManager.subscribe()`.
@@ -291,8 +301,24 @@ notifications instead of holding an SSE stream open:
    (`404`/`410` from the push service) are pruned automatically.
 4. `DELETE …/subscriptions` with `{ "endpoint": … }` removes one → `204`.
 
-Each mailbox holds at most `MAX_SUBSCRIPTIONS_PER_MAILBOX` subscriptions, and
-subscriptions die with the mailbox.
+**APNs (native iOS apps)** — enabled by `APNS_TEAM_ID`, `APNS_KEY_ID`,
+`APNS_TOPIC` (the app's bundle ID), and the `.p8` signing key
+(`APNS_KEY_PATH` or `APNS_KEY_BASE64`). Create the key once in the Apple
+Developer portal under *Certificates, Identifiers & Profiles → Keys* with the
+APNs capability; it works for all your apps and does not expire like
+certificates do.
+
+1. The app registers for remote notifications and receives a device token.
+2. `POST /api/addresses/{address}/subscriptions` (owner token) with
+   `{ "device_token": "<hex token>" }` → `201`.
+3. New mail triggers an alert push (title = subject, body = extracted code or
+   sender, sound default) with the same `{ address, id, from, subject, code }`
+   JSON under the `anonymail` custom key for deep-linking. Tokens Apple
+   reports as `Unregistered`/`BadDeviceToken` are pruned automatically.
+4. `DELETE …/subscriptions` with `{ "device_token": … }` removes one → `204`.
+
+Set `APNS_SANDBOX=true` only when the app is an Xcode debug build; TestFlight
+and App Store builds use the production gateway (the default).
 
 ### Attachment & HTML safety
 
@@ -425,7 +451,7 @@ src/
   events.rs          broadcast event bus for SSE + push
   mime.rs            mail-parser -> NewMessage
   otp.rs             verification-code extraction for the `code` event field
-  push.rs            Web Push worker: VAPID sends, stale-subscription pruning
+  push.rs            push worker: Web Push (VAPID) + APNs senders, pruning
   cleanup.rs         expired-mailbox purge + store maintenance task
   store/             Store trait + SQLite, Postgres, and in-memory backends
   smtp/              accept loop, session state machine, commands, STARTTLS

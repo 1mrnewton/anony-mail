@@ -26,6 +26,15 @@ services:
       VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
       VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
       VAPID_SUBJECT: ${VAPID_SUBJECT:-}
+      # APNs / native iOS push (optional): set all four to enable. The key is
+      # easiest to pass inline as base64 (`base64 -i AuthKey_XXXXXXXXXX.p8`);
+      # to use APNS_KEY_PATH instead, mount the .p8 file under volumes below.
+      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+      APNS_KEY_ID: ${APNS_KEY_ID:-}
+      APNS_TOPIC: ${APNS_TOPIC:-}
+      APNS_KEY_BASE64: ${APNS_KEY_BASE64:-}
+      APNS_KEY_PATH: ${APNS_KEY_PATH:-}
+      APNS_SANDBOX: ${APNS_SANDBOX:-false}
     volumes:
       - maildata:/data
     ports:

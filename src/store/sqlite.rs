@@ -12,7 +12,7 @@ use uuid::Uuid;
 use super::{MailboxQuotas, Store, SubscriptionLimit};
 use crate::model::{
     Attachment, AttachmentMeta, Mailbox, MessageSummary, NewMessage, PushSubscription,
-    StoredMessage,
+    StoredMessage, SubscriptionKind,
 };
 
 /// SQLite-backed [`Store`] implementation using `sqlx`.
@@ -174,6 +174,7 @@ struct AttachmentMetaRow {
 struct PushSubscriptionRow {
     id: String,
     mailbox_address: String,
+    kind: String,
     endpoint: String,
     p256dh: String,
     auth: String,
@@ -187,6 +188,7 @@ impl TryFrom<PushSubscriptionRow> for PushSubscription {
         Ok(PushSubscription {
             id: parse_uuid(&r.id)?,
             mailbox_address: r.mailbox_address,
+            kind: r.kind.parse()?,
             endpoint: r.endpoint,
             p256dh: r.p256dh,
             auth: r.auth,
@@ -565,6 +567,7 @@ impl Store for SqliteStore {
     async fn add_subscription(
         &self,
         address: &str,
+        kind: SubscriptionKind,
         endpoint: &str,
         p256dh: &str,
         auth: &str,
@@ -572,10 +575,10 @@ impl Store for SqliteStore {
     ) -> Result<PushSubscription> {
         let mut tx = self.pool.begin().await?;
 
-        // Upsert: refreshing an existing endpoint replaces its keys and does
-        // not count against the cap.
+        // Upsert: refreshing an existing endpoint replaces its kind and keys
+        // and does not count against the cap.
         let existing: Option<PushSubscriptionRow> = sqlx::query_as(
-            "SELECT id, mailbox_address, endpoint, p256dh, auth, created_at
+            "SELECT id, mailbox_address, kind, endpoint, p256dh, auth, created_at
              FROM push_subscriptions WHERE mailbox_address = ? AND endpoint = ?",
         )
         .bind(address)
@@ -584,14 +587,18 @@ impl Store for SqliteStore {
         .await?;
 
         if let Some(row) = existing {
-            sqlx::query("UPDATE push_subscriptions SET p256dh = ?, auth = ? WHERE id = ?")
-                .bind(p256dh)
-                .bind(auth)
-                .bind(&row.id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE push_subscriptions SET kind = ?, p256dh = ?, auth = ? WHERE id = ?",
+            )
+            .bind(kind.as_str())
+            .bind(p256dh)
+            .bind(auth)
+            .bind(&row.id)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
             return Ok(PushSubscription {
+                kind,
                 p256dh: p256dh.to_string(),
                 auth: auth.to_string(),
                 ..row.try_into()?
@@ -612,11 +619,12 @@ impl Store for SqliteStore {
         let id = Uuid::new_v4();
         let created_at = Utc::now();
         sqlx::query(
-            "INSERT INTO push_subscriptions (id, mailbox_address, endpoint, p256dh, auth, created_at)
-             VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO push_subscriptions (id, mailbox_address, kind, endpoint, p256dh, auth, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(address)
+        .bind(kind.as_str())
         .bind(endpoint)
         .bind(p256dh)
         .bind(auth)
@@ -628,6 +636,7 @@ impl Store for SqliteStore {
         Ok(PushSubscription {
             id,
             mailbox_address: address.to_string(),
+            kind,
             endpoint: endpoint.to_string(),
             p256dh: p256dh.to_string(),
             auth: auth.to_string(),
@@ -637,7 +646,7 @@ impl Store for SqliteStore {
 
     async fn list_subscriptions(&self, address: &str) -> Result<Vec<PushSubscription>> {
         let rows: Vec<PushSubscriptionRow> = sqlx::query_as(
-            "SELECT id, mailbox_address, endpoint, p256dh, auth, created_at
+            "SELECT id, mailbox_address, kind, endpoint, p256dh, auth, created_at
              FROM push_subscriptions WHERE mailbox_address = ? ORDER BY created_at",
         )
         .bind(address)

@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// A disposable inbox.
@@ -86,16 +86,52 @@ pub struct NewAttachment {
     pub content: Vec<u8>,
 }
 
-/// A Web Push subscription registered for a mailbox (docs/06). Internal only —
-/// the endpoint and keys are client credentials and are never serialized out.
+/// Which push channel a subscription targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubscriptionKind {
+    /// W3C Web Push (browsers / PWAs), delivered with VAPID.
+    WebPush,
+    /// Apple Push Notification service (native iOS/macOS apps).
+    Apns,
+}
+
+impl SubscriptionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WebPush => "webpush",
+            Self::Apns => "apns",
+        }
+    }
+}
+
+impl std::str::FromStr for SubscriptionKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "webpush" => Ok(Self::WebPush),
+            "apns" => Ok(Self::Apns),
+            other => Err(anyhow::anyhow!("unknown subscription kind: {other}")),
+        }
+    }
+}
+
+/// A push subscription registered for a mailbox (docs/06). Internal only —
+/// the endpoint/token and keys are client credentials and are never
+/// serialized out.
 #[derive(Debug, Clone)]
 pub struct PushSubscription {
     pub id: Uuid,
     pub mailbox_address: String,
+    pub kind: SubscriptionKind,
+    /// For `webpush`: the push-service URL. For `apns`: the hex device token.
     pub endpoint: String,
     /// Client public key (base64url), from `PushSubscription.getKey('p256dh')`.
+    /// Empty for `apns`.
     pub p256dh: String,
     /// Client auth secret (base64url), from `PushSubscription.getKey('auth')`.
+    /// Empty for `apns`.
     pub auth: String,
     pub created_at: DateTime<Utc>,
 }

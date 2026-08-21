@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
+use base64::Engine as _;
 
 use crate::store::MailboxQuotas;
 
@@ -120,8 +121,22 @@ pub struct Config {
     /// VAPID `sub` claim, a contact URI for push-service operators. Defaults
     /// to `mailto:postmaster@<first domain>`.
     pub vapid_subject: String,
-    /// Max Web Push subscriptions per mailbox (0 disables the cap).
+    /// Max push subscriptions per mailbox, all kinds combined (0 disables the
+    /// cap).
     pub max_subscriptions_per_mailbox: u32,
+    /// APNs: Apple Developer Team ID (native iOS push). APNs is enabled only
+    /// when team ID, key ID, signing key, and topic are all set.
+    pub apns_team_id: Option<String>,
+    /// APNs: the 10-character key ID of the `.p8` signing key.
+    pub apns_key_id: Option<String>,
+    /// APNs: PEM contents of the `.p8` token-signing key, loaded from
+    /// `APNS_KEY_PATH` (file) or `APNS_KEY_BASE64` (inline). Secret.
+    pub apns_private_key: Option<String>,
+    /// APNs: the topic notifications are sent under — the app's bundle ID.
+    pub apns_topic: Option<String>,
+    /// APNs: send through the sandbox environment (Xcode/dev builds of the
+    /// app). Default: production.
+    pub apns_sandbox: bool,
     /// Auto-create a default-TTL mailbox when mail arrives for an unknown
     /// local part on an accepted domain (U1). Never applies to reserved local
     /// parts. Off by default.
@@ -176,6 +191,11 @@ impl Default for Config {
             vapid_private_key: None,
             vapid_subject: "mailto:postmaster@example.com".to_string(),
             max_subscriptions_per_mailbox: 5,
+            apns_team_id: None,
+            apns_key_id: None,
+            apns_private_key: None,
+            apns_topic: None,
+            apns_sandbox: false,
             catch_all_enabled: false,
             store_raw_message: false,
         }
@@ -307,6 +327,47 @@ impl Config {
             "MAX_SUBSCRIPTIONS_PER_MAILBOX",
             base.max_subscriptions_per_mailbox,
         )?;
+
+        let apns_team_id = non_empty_env("APNS_TEAM_ID");
+        let apns_key_id = non_empty_env("APNS_KEY_ID");
+        let apns_topic = non_empty_env("APNS_TOPIC");
+        let apns_private_key = match (
+            non_empty_env("APNS_KEY_PATH"),
+            non_empty_env("APNS_KEY_BASE64"),
+        ) {
+            (Some(_), Some(_)) => {
+                bail!("set only one of APNS_KEY_PATH and APNS_KEY_BASE64");
+            }
+            (Some(path), None) => Some(
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading APNS_KEY_PATH ({path})"))?,
+            ),
+            (None, Some(b64)) => {
+                let compact: String = b64.chars().filter(|c| !c.is_whitespace()).collect();
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(compact.as_bytes())
+                    .context("APNS_KEY_BASE64 is not valid base64")?;
+                Some(
+                    String::from_utf8(bytes)
+                        .context("APNS_KEY_BASE64 does not decode to PEM text")?,
+                )
+            }
+            (None, None) => None,
+        };
+        let apns_parts = [
+            apns_team_id.is_some(),
+            apns_key_id.is_some(),
+            apns_private_key.is_some(),
+            apns_topic.is_some(),
+        ];
+        if apns_parts.iter().any(|&set| set) && !apns_parts.iter().all(|&set| set) {
+            bail!(
+                "APNs requires APNS_TEAM_ID, APNS_KEY_ID, APNS_TOPIC, and a key \
+                 (APNS_KEY_PATH or APNS_KEY_BASE64) together — set all or none"
+            );
+        }
+        let apns_sandbox = parse_env("APNS_SANDBOX", base.apns_sandbox)?;
+
         let catch_all_enabled = parse_env("CATCH_ALL_ENABLED", base.catch_all_enabled)?;
         let store_raw_message = parse_env("STORE_RAW_MESSAGE", base.store_raw_message)?;
 
@@ -343,6 +404,11 @@ impl Config {
             vapid_private_key,
             vapid_subject,
             max_subscriptions_per_mailbox,
+            apns_team_id,
+            apns_key_id,
+            apns_private_key,
+            apns_topic,
+            apns_sandbox,
             catch_all_enabled,
             store_raw_message,
         })
@@ -351,6 +417,20 @@ impl Config {
     /// True when Web Push is enabled (a VAPID keypair is configured).
     pub fn push_configured(&self) -> bool {
         self.vapid_public_key.is_some() && self.vapid_private_key.is_some()
+    }
+
+    /// True when APNs (native iOS push) is enabled: team ID, key ID, signing
+    /// key, and topic are all configured.
+    pub fn apns_configured(&self) -> bool {
+        self.apns_team_id.is_some()
+            && self.apns_key_id.is_some()
+            && self.apns_private_key.is_some()
+            && self.apns_topic.is_some()
+    }
+
+    /// True when at least one push channel is enabled.
+    pub fn any_push_configured(&self) -> bool {
+        self.push_configured() || self.apns_configured()
     }
 
     /// Selects the storage backend from the `DATABASE_URL` scheme. Anything
@@ -423,6 +503,14 @@ fn env_or(key: &str, default: &str) -> String {
 }
 
 /// Parse an env var into `T`, falling back to `default` when unset or blank.
+/// A trimmed, non-empty environment variable, or `None`.
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn parse_env<T>(key: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr,

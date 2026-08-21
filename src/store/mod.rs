@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::model::{
     Attachment, Mailbox, MessageSummary, NewMessage, PushSubscription, StoredMessage,
+    SubscriptionKind,
 };
 
 pub use memory::MemoryStore;
@@ -147,13 +148,16 @@ pub trait Store: Send + Sync + 'static {
     /// Delete all mailboxes that expired on or before `now`. Returns the count.
     async fn purge_expired(&self, now: DateTime<Utc>) -> anyhow::Result<u64>;
 
-    /// Register (or refresh) a Web Push subscription for a mailbox. Upserts on
-    /// `(mailbox_address, endpoint)`, so re-subscribing from the same browser
-    /// is idempotent. Fails with [`SubscriptionLimit`] when the mailbox already
-    /// has `max_per_mailbox` other subscriptions (0 = unlimited).
+    /// Register (or refresh) a push subscription for a mailbox. Upserts on
+    /// `(mailbox_address, endpoint)`, so re-subscribing from the same client
+    /// is idempotent (and may switch the `kind`). For `apns` subscriptions the
+    /// `endpoint` is the device token and the key fields are empty. Fails with
+    /// [`SubscriptionLimit`] when the mailbox already has `max_per_mailbox`
+    /// other subscriptions (0 = unlimited).
     async fn add_subscription(
         &self,
         address: &str,
+        kind: SubscriptionKind,
         endpoint: &str,
         p256dh: &str,
         auth: &str,

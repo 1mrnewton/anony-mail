@@ -114,6 +114,7 @@ where
             "/api/addresses/{address}/messages/{id}/attachments/{attachment_id}",
             get(messages::get_attachment),
         )
+        .route("/api/push/config", get(push::config))
         .route("/api/push/vapid-public-key", get(push::vapid_public_key))
         .route(
             "/api/addresses/{address}/subscriptions",

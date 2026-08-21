@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anony_mail::api::is_unique_violation;
-use anony_mail::model::{NewAttachment, NewMessage};
+use anony_mail::model::{NewAttachment, NewMessage, SubscriptionKind};
 use anony_mail::store::{MailboxQuotas, MemoryStore, SqliteStore, Store, SubscriptionLimit};
 use chrono::{Duration, Utc};
 
@@ -406,18 +406,39 @@ async fn push_subscription_crud_cap_and_cascade() {
 
         // Register two endpoints (cap = 2).
         let s1 = store
-            .add_subscription(addr, "https://push.example/ep1", "key1", "auth1", 2)
+            .add_subscription(
+                addr,
+                SubscriptionKind::WebPush,
+                "https://push.example/ep1",
+                "key1",
+                "auth1",
+                2,
+            )
             .await
             .unwrap();
         store
-            .add_subscription(addr, "https://push.example/ep2", "key2", "auth2", 2)
+            .add_subscription(
+                addr,
+                SubscriptionKind::WebPush,
+                "https://push.example/ep2",
+                "key2",
+                "auth2",
+                2,
+            )
             .await
             .unwrap();
 
         // Same endpoint again: upsert (keys refreshed, same logical sub, no
         // cap consumption).
         let s1b = store
-            .add_subscription(addr, "https://push.example/ep1", "key1-new", "auth1-new", 2)
+            .add_subscription(
+                addr,
+                SubscriptionKind::WebPush,
+                "https://push.example/ep1",
+                "key1-new",
+                "auth1-new",
+                2,
+            )
             .await
             .unwrap();
         assert_eq!(s1.id, s1b.id, "[{}] upsert must keep identity", ts.name);
@@ -425,7 +446,14 @@ async fn push_subscription_crud_cap_and_cascade() {
 
         // A third distinct endpoint busts the cap with the typed error.
         let err = store
-            .add_subscription(addr, "https://push.example/ep3", "key3", "auth3", 2)
+            .add_subscription(
+                addr,
+                SubscriptionKind::WebPush,
+                "https://push.example/ep3",
+                "key3",
+                "auth3",
+                2,
+            )
             .await
             .expect_err("cap must be enforced");
         assert!(
@@ -458,6 +486,89 @@ async fn push_subscription_crud_cap_and_cascade() {
     }
 }
 
+/// Push: APNs subscriptions (kind + device token, no keys) roundtrip through
+/// the store, share the cap with Web Push, and an upsert can switch kinds.
+#[tokio::test]
+async fn subscription_kinds_roundtrip_and_share_the_cap() {
+    for ts in all_stores().await {
+        let store = &ts.store;
+        let addr = "iphone@example.com";
+        store
+            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .await
+            .unwrap();
+
+        let apns = store
+            .add_subscription(addr, SubscriptionKind::Apns, "cafebabe1234", "", "", 2)
+            .await
+            .unwrap();
+        assert_eq!(apns.kind, SubscriptionKind::Apns, "[{}]", ts.name);
+        assert_eq!(apns.endpoint, "cafebabe1234", "[{}]", ts.name);
+        assert!(
+            apns.p256dh.is_empty() && apns.auth.is_empty(),
+            "[{}] apns rows carry no web push keys",
+            ts.name
+        );
+
+        // The kind survives a store roundtrip.
+        let listed = store.list_subscriptions(addr).await.unwrap();
+        assert_eq!(listed.len(), 1, "[{}]", ts.name);
+        assert_eq!(listed[0].kind, SubscriptionKind::Apns, "[{}]", ts.name);
+
+        // Mixed kinds share the per-mailbox cap.
+        store
+            .add_subscription(
+                addr,
+                SubscriptionKind::WebPush,
+                "https://push.example/ep",
+                "k",
+                "a",
+                2,
+            )
+            .await
+            .unwrap();
+        let err = store
+            .add_subscription(addr, SubscriptionKind::Apns, "feedface5678", "", "", 2)
+            .await
+            .expect_err("cap counts all kinds");
+        assert!(
+            err.downcast_ref::<SubscriptionLimit>().is_some(),
+            "[{}] expected SubscriptionLimit, got: {err}",
+            ts.name
+        );
+
+        // Upserting the same identifier may switch the kind.
+        let switched = store
+            .add_subscription(
+                addr,
+                SubscriptionKind::WebPush,
+                "cafebabe1234",
+                "k2",
+                "a2",
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(switched.id, apns.id, "[{}] upsert keeps identity", ts.name);
+        assert_eq!(
+            switched.kind,
+            SubscriptionKind::WebPush,
+            "[{}] upsert updates the kind",
+            ts.name
+        );
+
+        // Deleting by the device token works like deleting by endpoint.
+        assert!(
+            store
+                .delete_subscription(addr, "cafebabe1234")
+                .await
+                .unwrap(),
+            "[{}]",
+            ts.name
+        );
+    }
+}
+
 /// Push: purging an expired mailbox also removes its subscriptions.
 #[tokio::test]
 async fn purge_removes_push_subscriptions() {
@@ -469,7 +580,14 @@ async fn purge_removes_push_subscriptions() {
             .await
             .unwrap();
         store
-            .add_subscription(addr, "https://push.example/ep", "k", "a", 0)
+            .add_subscription(
+                addr,
+                SubscriptionKind::WebPush,
+                "https://push.example/ep",
+                "k",
+                "a",
+                0,
+            )
             .await
             .unwrap();
 

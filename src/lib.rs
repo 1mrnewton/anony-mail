@@ -80,21 +80,38 @@ pub async fn run() -> Result<()> {
         tokio::spawn(async move { cleanup::run(store, interval).await })
     };
 
-    // Web Push worker: only when a VAPID keypair is configured.
-    if config.push_configured() {
-        match push::WebPushSender::from_config(&config) {
-            Some(sender) => {
-                let store = Arc::clone(&store);
-                let events = events.clone();
-                tokio::spawn(async move {
-                    push::run(store, events, Arc::new(sender)).await;
-                });
-                info!("web push enabled");
+    // Push worker: spawned when at least one channel has credentials.
+    {
+        let mut senders = push::Senders::default();
+        if config.push_configured() {
+            match push::WebPushSender::from_config(&config) {
+                Some(sender) => {
+                    senders.webpush = Some(Arc::new(sender));
+                    info!("web push enabled");
+                }
+                None => error!("web push mis-configured; continuing without it"),
             }
-            None => error!("web push mis-configured; continuing without it"),
+        } else {
+            info!("web push disabled (no VAPID keypair configured)");
         }
-    } else {
-        info!("web push disabled (no VAPID keypair configured)");
+        if config.apns_configured() {
+            match push::ApnsSender::from_config(&config) {
+                Some(sender) => {
+                    senders.apns = Some(Arc::new(sender));
+                    info!(sandbox = config.apns_sandbox, "apns push enabled");
+                }
+                None => error!("apns mis-configured; continuing without it"),
+            }
+        } else {
+            info!("apns push disabled (no APNs credentials configured)");
+        }
+        if !senders.is_empty() {
+            let store = Arc::clone(&store);
+            let events = events.clone();
+            tokio::spawn(async move {
+                push::run(store, events, senders).await;
+            });
+        }
     }
     let api_task = tokio::spawn(async move {
         info!(%api_addr, "HTTP API listening");

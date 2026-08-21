@@ -7,7 +7,7 @@ use uuid::Uuid;
 use super::{MailboxQuotas, Store, SubscriptionLimit};
 use crate::model::{
     Attachment, AttachmentMeta, Mailbox, MessageSummary, NewMessage, PushSubscription,
-    StoredMessage,
+    StoredMessage, SubscriptionKind,
 };
 
 /// Postgres-backed [`Store`] implementation using `sqlx`.
@@ -440,6 +440,7 @@ impl Store for PostgresStore {
     async fn add_subscription(
         &self,
         address: &str,
+        kind: SubscriptionKind,
         endpoint: &str,
         p256dh: &str,
         auth: &str,
@@ -464,31 +465,32 @@ impl Store for PostgresStore {
         }
 
         let row: PushSubscriptionRow = sqlx::query_as(
-            "INSERT INTO push_subscriptions (mailbox_address, endpoint, p256dh, auth)
-             VALUES ($1, $2, $3, $4)
+            "INSERT INTO push_subscriptions (mailbox_address, kind, endpoint, p256dh, auth)
+             VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT (mailbox_address, endpoint)
-             DO UPDATE SET p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth
-             RETURNING id, mailbox_address, endpoint, p256dh, auth, created_at",
+             DO UPDATE SET kind = EXCLUDED.kind, p256dh = EXCLUDED.p256dh, auth = EXCLUDED.auth
+             RETURNING id, mailbox_address, kind, endpoint, p256dh, auth, created_at",
         )
         .bind(address)
+        .bind(kind.as_str())
         .bind(endpoint)
         .bind(p256dh)
         .bind(auth)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(row.into())
+        row.try_into()
     }
 
     async fn list_subscriptions(&self, address: &str) -> Result<Vec<PushSubscription>> {
         let rows: Vec<PushSubscriptionRow> = sqlx::query_as(
-            "SELECT id, mailbox_address, endpoint, p256dh, auth, created_at
+            "SELECT id, mailbox_address, kind, endpoint, p256dh, auth, created_at
              FROM push_subscriptions WHERE mailbox_address = $1 ORDER BY created_at",
         )
         .bind(address)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        rows.into_iter().map(TryInto::try_into).collect()
     }
 
     async fn delete_subscription(&self, address: &str, endpoint: &str) -> Result<bool> {
@@ -507,21 +509,25 @@ impl Store for PostgresStore {
 struct PushSubscriptionRow {
     id: Uuid,
     mailbox_address: String,
+    kind: String,
     endpoint: String,
     p256dh: String,
     auth: String,
     created_at: DateTime<Utc>,
 }
 
-impl From<PushSubscriptionRow> for PushSubscription {
-    fn from(r: PushSubscriptionRow) -> Self {
-        PushSubscription {
+impl TryFrom<PushSubscriptionRow> for PushSubscription {
+    type Error = anyhow::Error;
+
+    fn try_from(r: PushSubscriptionRow) -> Result<Self> {
+        Ok(PushSubscription {
             id: r.id,
             mailbox_address: r.mailbox_address,
+            kind: r.kind.parse()?,
             endpoint: r.endpoint,
             p256dh: r.p256dh,
             auth: r.auth,
             created_at: r.created_at,
-        }
+        })
     }
 }

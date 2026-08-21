@@ -38,3 +38,4 @@ sha2 = "0.11.0"
 base64 = "0.23.1"
 web-push = { version = "0.11.0", default-features = false, features = ["hyper-client"] }
 regex = "1.13.1"
+a2 = "0.10.0"

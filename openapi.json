@@ -663,6 +663,25 @@
         }
       }
     },
+    "/api/push/config": {
+      "get": {
+        "operationId": "getPushConfig",
+        "summary": "Which push channels are enabled",
+        "description": "Reports which push channels this server can deliver on: `webpush` (browsers/PWAs via VAPID) and `apns` (native iOS apps). Use it to decide whether to prompt the user for notification permission at all.",
+        "tags": ["Push"],
+        "responses": {
+          "200": {
+            "description": "Channel availability.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PushConfigResponse" },
+                "example": { "webpush": true, "apns": true }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/push/vapid-public-key": {
       "get": {
         "operationId": "getVapidPublicKey",
@@ -691,21 +710,32 @@
       ],
       "post": {
         "operationId": "subscribePush",
-        "summary": "Register a Web Push subscription",
-        "description": "Registers the browser's `PushSubscription` for this mailbox so new-mail notifications are pushed to the device. Requires the owner token. Idempotent per `(mailbox, endpoint)`: re-subscribing from the same browser refreshes the keys instead of creating a duplicate. The number of subscriptions per mailbox is capped server-side (`MAX_SUBSCRIPTIONS_PER_MAILBOX`, default 5).",
+        "summary": "Register a push subscription (Web Push or APNs)",
+        "description": "Registers a push subscription for this mailbox so new-mail notifications reach the device. Requires the owner token. Two shapes share this endpoint:\n\n- **Web Push** (browser/PWA): send `PushSubscription.toJSON()`, i.e. `{ endpoint, keys: { p256dh, auth } }`.\n- **APNs** (native iOS app): send `{ device_token }` — the hex token from `didRegisterForRemoteNotificationsWithDeviceToken`.\n\nThe `kind` field is optional; it is inferred from which identifier is present. Subscribing to a channel the server has no credentials for answers `503` (check `GET /api/push/config` first). Idempotent per `(mailbox, endpoint/token)`: re-subscribing refreshes the record instead of creating a duplicate. The number of subscriptions per mailbox (all kinds combined) is capped server-side (`MAX_SUBSCRIPTIONS_PER_MAILBOX`, default 5).",
         "tags": ["Push"],
         "security": [{ "ownerToken": [] }],
         "requestBody": {
           "required": true,
-          "description": "The browser subscription, i.e. `PushSubscription.toJSON()`.",
+          "description": "A Web Push subscription or an APNs device token.",
           "content": {
             "application/json": {
               "schema": { "$ref": "#/components/schemas/SubscribeRequest" },
-              "example": {
-                "endpoint": "https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH...",
-                "keys": {
-                  "p256dh": "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM",
-                  "auth": "tBHItJI5svbpez7KI4CCXg"
+              "examples": {
+                "webpush": {
+                  "summary": "Browser / PWA (Web Push)",
+                  "value": {
+                    "endpoint": "https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH...",
+                    "keys": {
+                      "p256dh": "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM",
+                      "auth": "tBHItJI5svbpez7KI4CCXg"
+                    }
+                  }
+                },
+                "apns": {
+                  "summary": "Native iOS app (APNs)",
+                  "value": {
+                    "device_token": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+                  }
                 }
               }
             }
@@ -717,7 +747,7 @@
             "content": {
               "application/json": {
                 "schema": { "$ref": "#/components/schemas/SubscribeResponse" },
-                "example": { "id": "8f14e45f-ceea-467f-a34e-9b7f7c3d9d10" }
+                "example": { "id": "8f14e45f-ceea-467f-a34e-9b7f7c3d9d10", "kind": "apns" }
               }
             }
           },
@@ -740,8 +770,8 @@
       },
       "delete": {
         "operationId": "unsubscribePush",
-        "summary": "Remove a Web Push subscription",
-        "description": "Unregisters the subscription identified by its `endpoint`. Requires the owner token.",
+        "summary": "Remove a push subscription",
+        "description": "Unregisters the subscription identified by its Web Push `endpoint` or APNs `device_token` (provide either). Requires the owner token. Works even when the server currently has no push credentials, so clients can always clean up.",
         "tags": ["Push"],
         "security": [{ "ownerToken": [] }],
         "requestBody": {
@@ -749,7 +779,16 @@
           "content": {
             "application/json": {
               "schema": { "$ref": "#/components/schemas/UnsubscribeRequest" },
-              "example": { "endpoint": "https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..." }
+              "examples": {
+                "webpush": {
+                  "summary": "By Web Push endpoint",
+                  "value": { "endpoint": "https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..." }
+                },
+                "apns": {
+                  "summary": "By APNs device token",
+                  "value": { "device_token": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2" }
+                }
+              }
             }
           }
         },
@@ -768,9 +807,6 @@
                 "example": { "error": "subscription not found" }
               }
             }
-          },
-          "503": {
-            "$ref": "#/components/responses/PushNotConfigured"
           }
         }
       }
@@ -899,11 +935,11 @@
         }
       },
       "PushNotConfigured": {
-        "description": "The server has no VAPID keypair configured, so Web Push is disabled.",
+        "description": "The server has no credentials for the requested push channel (no VAPID keypair for `webpush`, no APNs key for `apns`). Check `GET /api/push/config`.",
         "content": {
           "application/json": {
             "schema": { "$ref": "#/components/schemas/Error" },
-            "example": { "error": "push not configured" }
+            "example": { "error": "apns not configured" }
           }
         }
       },
@@ -1233,19 +1269,42 @@
           }
         }
       },
+      "PushConfigResponse": {
+        "type": "object",
+        "description": "Which push channels this server can deliver on.",
+        "required": ["webpush", "apns"],
+        "properties": {
+          "webpush": {
+            "type": "boolean",
+            "description": "True when a VAPID keypair is configured (browsers/PWAs).",
+            "examples": [true]
+          },
+          "apns": {
+            "type": "boolean",
+            "description": "True when APNs credentials are configured (native iOS apps).",
+            "examples": [true]
+          }
+        }
+      },
+      "SubscriptionKind": {
+        "type": "string",
+        "enum": ["webpush", "apns"],
+        "description": "Push channel: `webpush` (W3C Web Push with VAPID) or `apns` (Apple Push Notification service)."
+      },
       "SubscribeRequest": {
         "type": "object",
-        "description": "A browser Web Push subscription, exactly as produced by `PushSubscription.toJSON()`.",
-        "required": ["endpoint", "keys"],
+        "description": "A push subscription of either kind. Web Push: `{ endpoint, keys }`, exactly as produced by `PushSubscription.toJSON()`. APNs: `{ device_token }`. `kind` is optional and inferred from which identifier is present.",
         "properties": {
+          "kind": { "$ref": "#/components/schemas/SubscriptionKind" },
           "endpoint": {
             "type": "string",
             "format": "uri",
-            "description": "HTTPS push-service URL unique to this device/browser.",
+            "description": "Web Push only: HTTPS push-service URL unique to this device/browser.",
             "examples": ["https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..."]
           },
           "keys": {
             "type": "object",
+            "description": "Web Push only.",
             "required": ["p256dh", "auth"],
             "properties": {
               "p256dh": {
@@ -1259,32 +1318,42 @@
                 "examples": ["tBHItJI5svbpez7KI4CCXg"]
               }
             }
+          },
+          "device_token": {
+            "type": "string",
+            "description": "APNs only: the hex device token from `didRegisterForRemoteNotificationsWithDeviceToken`.",
+            "examples": ["a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"]
           }
         }
       },
       "SubscribeResponse": {
         "type": "object",
         "description": "Confirmation of a registered push subscription.",
-        "required": ["id"],
+        "required": ["id", "kind"],
         "properties": {
           "id": {
             "type": "string",
             "format": "uuid",
-            "description": "Server-side id of the subscription (stable across re-subscribes of the same endpoint).",
+            "description": "Server-side id of the subscription (stable across re-subscribes of the same endpoint/token).",
             "examples": ["8f14e45f-ceea-467f-a34e-9b7f7c3d9d10"]
-          }
+          },
+          "kind": { "$ref": "#/components/schemas/SubscriptionKind" }
         }
       },
       "UnsubscribeRequest": {
         "type": "object",
-        "description": "Identifies the subscription to remove by its endpoint.",
-        "required": ["endpoint"],
+        "description": "Identifies the subscription to remove: provide the Web Push `endpoint` or the APNs `device_token`.",
         "properties": {
           "endpoint": {
             "type": "string",
             "format": "uri",
-            "description": "The push-service URL used at registration.",
+            "description": "The push-service URL used at registration (Web Push).",
             "examples": ["https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..."]
+          },
+          "device_token": {
+            "type": "string",
+            "description": "The device token used at registration (APNs).",
+            "examples": ["a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"]
           }
         }
       },
