@@ -15,7 +15,7 @@ VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 help:
 	@echo "anony-mail image publishing"
 	@echo ""
-	@echo "  make release V=X.Y.Z Bump version in Cargo.{toml,lock}, commit and git-tag"
+	@echo "  make release V=X.Y.Z Bump version in Cargo.{toml,lock} + openapi.json, commit and git-tag"
 	@echo "  make docker-login   Log in to ghcr.io (needs \$$GHCR_TOKEN; \$$GHCR_USER optional)"
 	@echo "  make publish        Build $(PLATFORMS) and push :$(VERSION) and :latest"
 	@echo "  make docker-build   Build a single-arch image locally (no push)"
@@ -41,7 +41,8 @@ release:
 	@echo "Bumping $(VERSION) -> $(V)"
 	@sed -i.bak 's/^version = "$(VERSION)"/version = "$(V)"/' Cargo.toml && rm -f Cargo.toml.bak
 	@sed -i.bak '/^name = "anony-mail"$$/{n;s/^version = ".*"/version = "$(V)"/;}' Cargo.lock && rm -f Cargo.lock.bak
-	@git add Cargo.toml Cargo.lock
+	@sed -i.bak 's/"version": "$(VERSION)"/"version": "$(V)"/' openapi.json && rm -f openapi.json.bak
+	@git add Cargo.toml Cargo.lock openapi.json
 	@git commit -q -m "release: v$(V)"
 	@git tag -a "v$(V)" -m "anony-mail v$(V)"
 	@echo "Committed and tagged v$(V)."
