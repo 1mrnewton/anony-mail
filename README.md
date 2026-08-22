@@ -76,6 +76,9 @@ docker compose --profile postgres up -d
 Then create an address and watch for mail:
 
 ```bash
+# Interactive API docs (Scalar)
+open http://localhost:8080/docs
+
 # Create a random disposable address
 curl -s -X POST http://localhost:8080/api/addresses | jq
 # => { "address": "a1b2c3d4e5@example.com", "domain": "example.com",
@@ -140,6 +143,7 @@ Only `DOMAINS` is required; everything else has defaults.
 | `MAX_ADDRESSES_PER_IP_PER_DAY` | `200` | Per-IP daily creation quota (`0` disables) |
 | `API_REQUEST_TIMEOUT_SECONDS` | `30` | Timeout on non-SSE routes (`0` disables) |
 | `API_TRUST_PROXY_HEADERS` | `false` | Trust `X-Forwarded-For` etc. (only behind a proxy) |
+| `API_DOCS_ENABLED` | `true` | Serve Scalar at `/docs` and the spec at `/openapi.json` |
 | `SSE_MAX_CONCURRENT` | `512` | Global cap on open SSE streams (`0` disables) |
 | `SSE_MAX_PER_IP` | `8` | Per-IP cap on open SSE streams (`0` disables) |
 | `MAX_MESSAGES_PER_MAILBOX` | `50` | Per-mailbox message cap, drop-oldest (`0` disables) |
@@ -195,13 +199,17 @@ surviving restarts — not retaining mail indefinitely.
 
 Base path `/api`. Request/response bodies are JSON. Errors are
 `{ "error": "message" }` with an appropriate status code. The full contract
-lives in [openapi.json](openapi.json). Rows marked **owner** require the
+lives in [openapi.json](openapi.json); a running instance serves it at
+`/openapi.json` and a Scalar UI at `/docs` (disable both with
+`API_DOCS_ENABLED=false`). Rows marked **owner** require the
 mailbox's owner token as `Authorization: Bearer am_…`.
 
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | `GET` | `/healthz` | — | Liveness check |
 | `GET` | `/readyz` | — | Readiness check (pings the database) |
+| `GET` | `/docs` | — | Scalar API reference (`API_DOCS_ENABLED`) |
+| `GET` | `/openapi.json` | — | OpenAPI 3.1 document (`API_DOCS_ENABLED`) |
 | `GET` | `/api/domains` | — | List configured domains |
 | `POST` | `/api/addresses` | — | Create an address (see below) |
 | `GET` | `/api/addresses/{address}` | — | Mailbox info / existence check |

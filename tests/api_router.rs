@@ -22,7 +22,7 @@ use anony_mail::model::{NewAttachment, NewMessage};
 use anony_mail::store::{MemoryStore, Store};
 
 fn test_state() -> (Router, Arc<MemoryStore>) {
-    let config = Arc::new(Config {
+    test_state_with(Config {
         domains: vec!["example.com".to_string()],
         // Rate limiting is covered by its own config; disabled here so
         // oneshot requests don't need governor bookkeeping.
@@ -30,9 +30,16 @@ fn test_state() -> (Router, Arc<MemoryStore>) {
         create_rate_limit_per_minute: 0,
         max_addresses_per_ip_per_day: 0,
         ..Config::default()
-    });
+    })
+}
+
+fn test_state_with(config: Config) -> (Router, Arc<MemoryStore>) {
     let store = Arc::new(MemoryStore::new());
-    let state = AppState::new(store.clone() as Arc<dyn Store>, config, EventBus::new(16));
+    let state = AppState::new(
+        store.clone() as Arc<dyn Store>,
+        Arc::new(config),
+        EventBus::new(16),
+    );
     (api::router(state), store)
 }
 
@@ -82,6 +89,58 @@ async fn seed_message(store: &MemoryStore, address: &str) -> (uuid::Uuid, uuid::
         .await
         .unwrap();
     (saved.id, saved.attachments[0].id)
+}
+
+#[tokio::test]
+async fn docs_enabled_by_default_serves_scalar_and_spec() {
+    let (app, _) = test_state();
+
+    let docs = app.clone().oneshot(req("GET", "/docs")).await.unwrap();
+    assert_eq!(docs.status(), StatusCode::OK);
+    assert!(
+        docs.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    let html = String::from_utf8(
+        axum::body::to_bytes(docs.into_body(), 1024 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("@scalar/api-reference"));
+    assert!(html.contains("/openapi.json"));
+
+    let spec = app.oneshot(req("GET", "/openapi.json")).await.unwrap();
+    assert_eq!(spec.status(), StatusCode::OK);
+    assert!(
+        spec.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json")
+    );
+    let body = json_body(spec).await;
+    assert_eq!(body["openapi"], "3.1.0");
+    assert_eq!(body["info"]["version"], env!("CARGO_PKG_VERSION"));
+}
+
+#[tokio::test]
+async fn docs_disabled_returns_not_found() {
+    let (app, _) = test_state_with(Config {
+        domains: vec!["example.com".to_string()],
+        api_rate_limit_per_second: 0,
+        create_rate_limit_per_minute: 0,
+        max_addresses_per_ip_per_day: 0,
+        api_docs_enabled: false,
+        ..Config::default()
+    });
+
+    let docs = app.clone().oneshot(req("GET", "/docs")).await.unwrap();
+    assert_eq!(docs.status(), StatusCode::NOT_FOUND);
+    let spec = app.oneshot(req("GET", "/openapi.json")).await.unwrap();
+    assert_eq!(spec.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

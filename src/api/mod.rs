@@ -1,5 +1,6 @@
 pub mod addresses;
 pub mod auth;
+pub mod docs;
 pub mod limits;
 pub mod messages;
 pub mod push;
@@ -121,6 +122,12 @@ where
             post(push::subscribe).delete(push::unsubscribe),
         )
         .merge(create_route);
+
+    // Docs routes are merged (not `.route(...)` here) so the OpenAPI drift
+    // scrape does not treat `/docs` and `/openapi.json` as product API paths.
+    if config.api_docs_enabled {
+        non_sse = non_sse.merge(docs::router());
+    }
 
     // Requests on non-SSE routes must finish within a bounded time; the SSE
     // route is intentionally excluded (streams are long-lived by design).

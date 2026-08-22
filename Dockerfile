@@ -14,8 +14,10 @@ RUN apt-get update \
 COPY Cargo.toml Cargo.lock ./
 # migrations/ must be present at build time: they are embedded into the binary
 # via sqlx::migrate!(), so the runtime image needs no migration files.
+# openapi.json is include_str!'d into the docs handler the same way.
 COPY migrations ./migrations
 COPY src ./src
+COPY openapi.json ./
 
 # Cache cargo registry + target across builds so a source-only change does not
 # recompile the world. Copy the binary *out* of the cache mount — mounts are

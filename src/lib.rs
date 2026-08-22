@@ -114,7 +114,11 @@ pub async fn run() -> Result<()> {
         }
     }
     let api_task = tokio::spawn(async move {
-        info!(%api_addr, "HTTP API listening");
+        if config.api_docs_enabled {
+            info!(%api_addr, "HTTP API listening; docs at /docs");
+        } else {
+            info!(%api_addr, "HTTP API listening");
+        }
         // Connect info exposes the peer address to rate limiting and quotas.
         axum::serve(
             listener,
