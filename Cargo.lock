@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "anony-mail"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "a2",
  "anyhow",
