@@ -1,6 +1,9 @@
 pub mod api;
+pub mod attest;
 pub mod cleanup;
 pub mod config;
+pub mod custom_domains;
+pub mod entitlements;
 pub mod events;
 pub mod mime;
 pub mod model;
@@ -62,6 +65,40 @@ pub async fn run() -> Result<()> {
     };
 
     let app_state = api::AppState::new(Arc::clone(&store), Arc::clone(&config), events.clone());
+
+    // Entitlements (docs/10): announce the effective posture once, loudly.
+    if config.entitlements_enforced {
+        if config.revenuecat_secret_key.is_some() {
+            info!("entitlements enforced (free/pro via RevenueCat)");
+        } else {
+            tracing::warn!(
+                "ENTITLEMENTS_ENFORCED=true but REVENUECAT_SECRET_KEY is unset: \
+                 every client is free tier and pro is unreachable"
+            );
+        }
+    } else if config.entitlements_supported() {
+        info!("entitlement tokens available but not enforced");
+    }
+
+    // App Attest (docs/09): announce the effective posture once, loudly.
+    if config.client_attestation_required {
+        info!("client attestation REQUIRED on mutating routes (App Attest)");
+    } else if config.app_attest_configured() {
+        info!("app attestation available but not required");
+    }
+
+    // Custom domains (docs/11): daily DNS re-verification of claimed domains.
+    if config.custom_domains_enabled {
+        info!("custom domains enabled");
+        let store = Arc::clone(&store);
+        let config = Arc::clone(&config);
+        let dns = Arc::clone(&app_state.dns);
+        tokio::spawn(async move {
+            custom_domains::reverify_loop(store, dns, config).await;
+        });
+    } else {
+        info!("custom domains disabled");
+    }
 
     let api_addr = config.api_bind_addr;
     let listener = tokio::net::TcpListener::bind(api_addr)

@@ -16,16 +16,31 @@ use crate::model::Mailbox;
 /// Greppable, obviously-a-secret prefix (like `sk_...`).
 pub const TOKEN_PREFIX: &str = "am_";
 
+/// Prefix for custom-domain claim tokens (docs/11), so the two credential
+/// kinds are never mistaken for each other.
+pub const DOMAIN_TOKEN_PREFIX: &str = "amd_";
+
 /// Generate a fresh owner token. Returns `(token, sha256_hex_of_token)`; only
 /// the hash may be persisted.
 pub fn generate_owner_token() -> (String, String) {
+    generate_token(TOKEN_PREFIX)
+}
+
+/// Generate a bearer token with the given prefix: 32 CSPRNG bytes, base64url.
+/// Returns `(token, sha256_hex_of_token)`; only the hash may be persisted.
+pub fn generate_token(prefix: &str) -> (String, String) {
     let bytes: [u8; 32] = rand::rng().random();
     let token = format!(
-        "{TOKEN_PREFIX}{}",
+        "{prefix}{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     );
     let hash = hash_token(&token);
     (token, hash)
+}
+
+/// True if `presented` hashes to `want_hash` (constant-time compare).
+pub fn token_matches_hash(presented: &str, want_hash: &str) -> bool {
+    constant_time_eq(hash_token(presented).as_bytes(), want_hash.as_bytes())
 }
 
 /// SHA-256 of the full token string (prefix included), lowercase hex.
@@ -71,7 +86,7 @@ pub async fn authorize_owner(
         ));
     };
 
-    if constant_time_eq(hash_token(presented).as_bytes(), want.as_bytes()) {
+    if token_matches_hash(presented, want) {
         Ok(mailbox)
     } else {
         Err(ApiError::Unauthorized("invalid owner token".to_string()))

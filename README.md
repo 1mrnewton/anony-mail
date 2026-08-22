@@ -18,6 +18,9 @@ frontend over a REST + Server-Sent-Events HTTP API. It does not send mail.
   for native iOS apps — the moment a message arrives.
 - Destructive/lifecycle operations (extend, delete, clear, subscribe) are
   gated by a per-mailbox **owner token** returned once at creation.
+- **Custom domains** (on by default): claim a domain you own, prove control
+  via DNS (TXT challenge + MX record), and receive mail on it — verified
+  domains are re-checked daily with a grace window for DNS hiccups.
 - Abuse controls throughout: per-IP rate limits and daily creation quotas,
   request timeouts, SSE concurrency caps, per-mailbox message/byte quotas
   (drop-oldest), reserved local parts, and a disk watermark for SQLite.
@@ -150,6 +153,17 @@ Only `DOMAINS` is required; everything else has defaults.
 | `MAX_MAILBOX_BYTES` | `41943040` | Per-mailbox byte cap (40 MiB), drop-oldest (`0` disables) |
 | `MIN_FREE_DISK_BYTES` | `268435456` | Refuse `DATA` below this free space (256 MiB; SQLite; `0` disables) |
 | `CATCH_ALL_ENABLED` | `false` | Auto-create mailboxes for unknown local parts |
+| `CUSTOM_DOMAINS_ENABLED` | `true` | Bring-your-own-domain endpoints + SMTP acceptance |
+| `MAX_CUSTOM_DOMAINS_PER_IP_PER_DAY` | `5` | Per-IP daily domain-claim quota (`0` disables) |
+| `CUSTOM_DOMAIN_VERIFY_THROTTLE_SECONDS` | `10` | Min spacing between DNS verify runs per domain (`0` disables) |
+| `ENTITLEMENTS_ENFORCED` | `false` | Enforce free/pro tiers server-side (see [Entitlements & tiers](#entitlements--tiers-hosted-instances)) |
+| `TOKEN_SIGNING_KEY` | unset | Client-token signing key (base64, ≥32 bytes); required to enforce |
+| `REVENUECAT_SECRET_KEY` | unset | Enables pro verification via RevenueCat |
+| `REVENUECAT_ENTITLEMENT_ID` | `Anony Mail Pro` | RevenueCat entitlement that marks pro |
+| `FREE_*` / `PRO_*` | see `.env.example` | Tier policy: mailbox caps, lifetime ceiling, local parts, domains |
+| `APP_ATTEST_TEAM_ID` / `APP_ATTEST_BUNDLE_ID` | unset | Enable App Attest endpoints (both + `TOKEN_SIGNING_KEY` required) |
+| `CLIENT_ATTESTATION_REQUIRED` | `false` | Demand an attested client token on every mutating route |
+| `APP_ATTEST_ROOT_CA_PATH` | embedded | Override Apple's App Attestation Root CA (PEM) |
 | `STORE_RAW_MESSAGE` | `false` | Retain original bytes; serves `GET …/messages/{id}/raw` |
 | `VAPID_PUBLIC_KEY` / `VAPID_PRIVATE_KEY` | unset | Enable Web Push (both required) |
 | `VAPID_SUBJECT` | `mailto:postmaster@<first domain>` | VAPID contact (`mailto:` or URL) |
@@ -202,7 +216,8 @@ Base path `/api`. Request/response bodies are JSON. Errors are
 lives in [openapi.json](openapi.json); a running instance serves it at
 `/openapi.json` and a Scalar UI at `/docs` (disable both with
 `API_DOCS_ENABLED=false`). Rows marked **owner** require the
-mailbox's owner token as `Authorization: Bearer am_…`.
+mailbox's owner token as `Authorization: Bearer am_…`; rows marked **claim**
+require the custom domain's claim token (`amd_…`).
 
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
@@ -210,7 +225,12 @@ mailbox's owner token as `Authorization: Bearer am_…`.
 | `GET` | `/readyz` | — | Readiness check (pings the database) |
 | `GET` | `/docs` | — | Scalar API reference (`API_DOCS_ENABLED`) |
 | `GET` | `/openapi.json` | — | OpenAPI 3.1 document (`API_DOCS_ENABLED`) |
+| `GET` | `/api/capabilities` | — | Feature flags + tier policy of this instance |
 | `GET` | `/api/domains` | — | List configured domains |
+| `POST` | `/api/entitlements/verify` | — | Mint a tier token from a RevenueCat purchase check |
+| `POST` | `/api/client/challenge` | — | Issue a single-use App Attest challenge (`APP_ATTEST_*`) |
+| `POST` | `/api/client/attest` | — | One-time device attestation → attested client token |
+| `POST` | `/api/client/assert` | — | Refresh an attested token via an App Attest assertion |
 | `POST` | `/api/addresses` | — | Create an address (see below) |
 | `GET` | `/api/addresses/{address}` | — | Mailbox info / existence check |
 | `POST` | `/api/addresses/{address}/extend` | owner | Extend expiry by the default TTL |
@@ -228,6 +248,10 @@ mailbox's owner token as `Authorization: Bearer am_…`.
 | `GET` | `/api/push/vapid-public-key` | — | VAPID public key (`503` if Web Push not configured) |
 | `POST` | `/api/addresses/{address}/subscriptions` | owner | Register a push subscription (Web Push or APNs) |
 | `DELETE` | `/api/addresses/{address}/subscriptions` | owner | Remove a push subscription (by endpoint or device token) |
+| `POST` | `/api/custom-domains` | — | Claim a custom domain (`CUSTOM_DOMAINS_ENABLED`) |
+| `GET` | `/api/custom-domains/{domain}` | claim | Claim status + the DNS records to publish |
+| `POST` | `/api/custom-domains/{domain}/verify` | claim | Run the DNS checks now |
+| `DELETE` | `/api/custom-domains/{domain}` | claim | Release the claim |
 
 ### Create an address
 
@@ -245,6 +269,9 @@ mailbox's owner token as `Authorization: Bearer am_…`.
   `400`.
 - Rate-limited per IP (`API_CREATE_RATE_LIMIT_PER_MINUTE`,
   `MAX_ADDRESSES_PER_IP_PER_DAY`) — expect `429` under abuse.
+- `domain` may also be a **verified custom domain**, in which case the request
+  must carry that domain's claim token (`Authorization: Bearer amd_…`) — see
+  [Custom domains](#custom-domains).
 
 Returns `201 Created` with the mailbox fields plus a one-time secret:
 
@@ -271,6 +298,88 @@ with the current token) invalidates it and returns a fresh one. Mailboxes with
 no token on record — created before this feature, or auto-created by the
 catch-all — can never pass owner-gated calls (`401`); they simply age out and
 expire.
+
+### Custom domains
+
+Receive mail at a domain you own (on by default; `CUSTOM_DOMAINS_ENABLED=false`
+to turn off — clients discover the feature via `GET /api/capabilities`):
+
+1. **Claim** — `POST /api/custom-domains` with `{ "domain": "mail.mycorp.com" }`
+   returns `201` with the records to publish and a one-time **claim token**
+   (`amd_…`) that gates everything else about the domain. The server's own
+   domains (and their subdomains) cannot be claimed.
+2. **Publish DNS** — a TXT record at `_anonymail.mail.mycorp.com` with the
+   returned `txt_record` value, and an MX record for `mail.mycorp.com`
+   pointing at the returned `mx_target` (this server's `SMTP_HOSTNAME`).
+3. **Verify** — `POST /api/custom-domains/{domain}/verify` runs both lookups
+   live and returns per-record results. When both pass the domain is
+   `verified`: SMTP accepts mail for it, and `POST /api/addresses` with
+   `{ "domain": "mail.mycorp.com" }` works when the claim token is sent as the
+   bearer token (so only the domain owner can mint mailboxes on it).
+
+Verified domains are re-checked daily in the background. Broken DNS is
+tolerated for a ~48h grace window, then the domain flips to `failed` (mail and
+creates stop) until a successful verify restores it. Deleting the claim stops
+mail immediately; existing mailboxes live out their TTL. The catch-all never
+applies to custom domains — only explicitly created mailboxes receive mail.
+Claims are rate-limited per IP (`MAX_CUSTOM_DOMAINS_PER_IP_PER_DAY`), and
+verify runs are throttled per domain (`CUSTOM_DOMAIN_VERIFY_THROTTLE_SECONDS`).
+
+### Entitlements & tiers (hosted instances)
+
+By default the server is **fully open**: every feature works for any client,
+no tiers, no tokens — the self-host experience. A hosted instance can flip
+`ENTITLEMENTS_ENFORCED=true` to enforce a free/pro split server-side.
+No accounts are involved; tier is proven by purchase:
+
+1. The app calls `POST /api/entitlements/verify` with its anonymous
+   RevenueCat app-user id. The server checks the pro entitlement
+   (`REVENUECAT_SECRET_KEY` + `REVENUECAT_ENTITLEMENT_ID`, verdicts cached
+   ~10 min) and returns a signed client token (HS256, `TOKEN_SIGNING_KEY`,
+   12h TTL) carrying `tier: free|pro`.
+2. The app sends that token as `X-Client-Token` on writes. **No token means
+   free tier** — never an error. Expired/forged tokens get a `401` with
+   `code: client_token_expired` / `client_token_invalid` so the app refreshes.
+3. Free-tier requests are gated per the `FREE_*` policy: custom local parts
+   (`403 pro_required`), domains beyond `FREE_DOMAIN_COUNT`, custom-domain
+   claims, and a total mailbox-lifetime ceiling on extend
+   (`FREE_MAX_LIFETIME_SECONDS`, `403 lifetime_cap`).
+
+`GET /api/capabilities` reports `entitlements.enforced` plus the full
+`free`/`pro` policy so clients drive their gates and paywall copy from the
+server instead of hardcoding numbers; when `enforced` is `false` clients
+should unlock everything. Policy errors carry a machine-readable `code`
+alongside the standard `error` message. Enforcement without a RevenueCat key
+is valid (a "goodwill" tiered instance): everyone is free tier and pro is
+unreachable.
+
+### Client attestation / App Attest (hosted instances)
+
+Tier tokens prove a *purchase*; they do not prove the request comes from a
+genuine build of the official app. A hosted instance can additionally turn on
+**Apple App Attest** — again, off by default so self-hosted servers stay
+fully open.
+
+Setting `APP_ATTEST_TEAM_ID` + `APP_ATTEST_BUNDLE_ID` (plus
+`TOKEN_SIGNING_KEY`) enables three endpoints:
+
+1. `POST /api/client/challenge` issues a single-use challenge (5 min TTL).
+2. `POST /api/client/attest` — once per install — verifies the device's
+   attestation **locally** (certificate chain to Apple's App Attestation Root
+   CA, embedded in the binary; the server never calls Apple), registers the
+   device key, and mints an **attested** client token (it runs the same
+   RevenueCat tier check as `/api/entitlements/verify`).
+3. `POST /api/client/assert` refreshes the token by verifying an assertion
+   signed with the registered key. The signature counter must strictly
+   increase, which blocks replay.
+
+Flipping `CLIENT_ATTESTATION_REQUIRED=true` then makes every mutating route
+demand an attested token (`401` / `code: attestation_required` otherwise);
+reads stay open. With entitlements also enforced, the per-device
+`FREE_ACTIVE_MAILBOXES` / `PRO_ACTIVE_MAILBOXES` caps bite on creation
+(`403` / `code: mailbox_cap`), since attested requests carry a stable,
+hashed device identity. Device records idle for ~180 days are pruned;
+such devices simply re-attest.
 
 ### Live updates (SSE)
 
@@ -339,14 +448,15 @@ and App Store builds use the production gateway (the default).
 
 ## SMTP behaviour
 
-- `RCPT TO` is accepted (`250`) only when the domain is one of `DOMAINS` **and**
-  the mailbox exists and is unexpired. Otherwise `550` (unknown/relay) so the
-  sending MTA gets a real bounce.
+- `RCPT TO` is accepted (`250`) only when the domain is one of `DOMAINS` — or a
+  **verified custom domain** — **and** the mailbox exists and is unexpired.
+  Otherwise `550` (unknown/relay) so the sending MTA gets a real bounce.
 - **Plus-addressing:** `user+anything@domain` delivers to `user@domain`; the
   tag is stripped before the mailbox lookup.
 - **Catch-all (opt-in):** with `CATCH_ALL_ENABLED=true`, mail to an unknown
   local part on an accepted domain auto-creates a default-TTL mailbox — except
-  for reserved local parts, which are still rejected.
+  for reserved local parts, which are still rejected. Custom domains are
+  excluded: only explicitly created mailboxes receive mail there.
 - `DATA` is capped at `MAX_MESSAGE_SIZE_BYTES`; oversize messages are drained to
   the terminator and rejected with `552`. On the SQLite backend, `DATA` is
   refused with `452` (transient, sender retries) when free disk space falls

@@ -7,8 +7,8 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::model::{
-    Attachment, Mailbox, MessageSummary, NewMessage, PushSubscription, StoredMessage,
-    SubscriptionKind,
+    Attachment, AttestedDevice, CustomDomain, CustomDomainStatus, Mailbox, MessageSummary,
+    NewMessage, PushSubscription, StoredMessage, SubscriptionKind,
 };
 
 pub use memory::MemoryStore;
@@ -66,12 +66,16 @@ pub trait Store: Send + Sync + 'static {
     /// Create a new mailbox. Fails if the address already exists.
     /// `owner_token_hash` is the SHA-256 hex of the owner bearer token (A2);
     /// `None` creates an ownerless mailbox that can never pass gated ops.
+    /// `creator_device_hash` is the SHA-256 hex of the attested device key id
+    /// (docs/09+10), scoping per-device mailbox caps; `None` for unattested
+    /// creates and SMTP catch-all.
     async fn create_mailbox(
         &self,
         address: &str,
         domain: &str,
         expires_at: DateTime<Utc>,
         owner_token_hash: Option<&str>,
+        creator_device_hash: Option<&str>,
     ) -> anyhow::Result<Mailbox>;
 
     /// Fetch a mailbox by address, if it exists (regardless of expiry).
@@ -170,6 +174,85 @@ pub trait Store: Send + Sync + 'static {
     /// Remove a subscription by endpoint. Returns true if a row was removed.
     /// Also used by the push worker to prune endpoints that answer 404/410.
     async fn delete_subscription(&self, address: &str, endpoint: &str) -> anyhow::Result<bool>;
+
+    /// Claim a custom domain (docs/11): insert a `pending` row holding the
+    /// claim-token hash and the TXT challenge token. Fails with a unique
+    /// violation if the domain is already claimed.
+    async fn create_custom_domain(
+        &self,
+        domain: &str,
+        claim_token_hash: &str,
+        txt_token: &str,
+    ) -> anyhow::Result<CustomDomain>;
+
+    /// Fetch a custom domain claim by (lowercase) domain name.
+    async fn get_custom_domain(&self, domain: &str) -> anyhow::Result<Option<CustomDomain>>;
+
+    /// Remove a custom domain claim. Mailboxes on the domain are *not*
+    /// cascaded — they live out their TTL; only new mail/creates stop.
+    /// Returns true if a row was removed.
+    async fn delete_custom_domain(&self, domain: &str) -> anyhow::Result<bool>;
+
+    /// True if the domain is claimed **and** currently `verified` — the SMTP
+    /// RCPT hot path and address creation both gate on this.
+    async fn custom_domain_is_verified(&self, domain: &str) -> anyhow::Result<bool>;
+
+    /// Record the outcome of a DNS check run: the new `status`, the new
+    /// last-success anchor (`verified_at`), and when the check ran. Returns
+    /// false if the domain vanished meanwhile.
+    async fn record_custom_domain_check(
+        &self,
+        domain: &str,
+        status: CustomDomainStatus,
+        verified_at: Option<DateTime<Utc>>,
+        checked_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool>;
+
+    /// Domains due for periodic re-verification: `verified` or `failed` rows
+    /// whose last check is missing or at/before `cutoff`. `pending` rows are
+    /// excluded — proving those is user-driven via the verify endpoint.
+    async fn list_custom_domains_to_recheck(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> anyhow::Result<Vec<CustomDomain>>;
+
+    /// Register an attested device (docs/09). Idempotent on `key_id`: a
+    /// re-attestation of a known key refreshes `last_seen_at` but keeps the
+    /// stored counter — resetting it would reopen the assertion-replay
+    /// window. Returns the stored row.
+    async fn upsert_attested_device(
+        &self,
+        key_id: &str,
+        public_key: &[u8],
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<AttestedDevice>;
+
+    /// Fetch an attested device by key id.
+    async fn get_attested_device(&self, key_id: &str) -> anyhow::Result<Option<AttestedDevice>>;
+
+    /// Advance a device's assertion counter to `counter` and refresh
+    /// `last_seen_at` — but only if `counter` is strictly greater than the
+    /// stored value (the database is the serialization point for concurrent
+    /// assertions). Returns false when the device is missing **or** the
+    /// counter did not advance, in which case the assertion must be rejected.
+    async fn advance_attested_device_counter(
+        &self,
+        key_id: &str,
+        counter: i64,
+        seen_at: DateTime<Utc>,
+    ) -> anyhow::Result<bool>;
+
+    /// Delete attested devices not seen since `idle_before` (docs/09 pruning;
+    /// affected devices simply re-attest). Returns the count removed.
+    async fn prune_attested_devices(&self, idle_before: DateTime<Utc>) -> anyhow::Result<u64>;
+
+    /// How many unexpired mailboxes were created by the given attested
+    /// device (docs/10 per-device active-mailbox cap).
+    async fn count_active_mailboxes_by_device(
+        &self,
+        creator_device_hash: &str,
+        now: DateTime<Utc>,
+    ) -> anyhow::Result<u64>;
 
     /// Backend-specific storage maintenance, invoked periodically by the
     /// cleanup task after purging (e.g. SQLite incremental vacuum). Default:

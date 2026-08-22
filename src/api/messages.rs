@@ -90,6 +90,7 @@ pub async fn clear(
     headers: HeaderMap,
 ) -> Result<Json<ClearInboxResponse>, ApiError> {
     let address = address.to_ascii_lowercase();
+    super::entitlements::attestation_gate(&state, &headers)?;
     authorize_owner(&state, &address, &headers).await?;
     let deleted = state.store.delete_all_messages(&address).await?;
     Ok(Json(ClearInboxResponse { deleted }))
@@ -103,6 +104,7 @@ pub async fn delete(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let address = address.to_ascii_lowercase();
+    super::entitlements::attestation_gate(&state, &headers)?;
     authorize_owner(&state, &address, &headers).await?;
     if state.store.delete_message(&address, id).await? {
         Ok(StatusCode::NO_CONTENT)

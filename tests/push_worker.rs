@@ -71,7 +71,13 @@ async fn delivers_to_every_subscription_with_minimal_payload() {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let addr = "inbox@example.com";
     store
-        .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+        .create_mailbox(
+            addr,
+            "example.com",
+            Utc::now() + Duration::hours(1),
+            None,
+            None,
+        )
         .await
         .unwrap();
     store
@@ -121,7 +127,13 @@ async fn gone_endpoints_are_pruned_others_survive() {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let addr = "inbox@example.com";
     store
-        .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+        .create_mailbox(
+            addr,
+            "example.com",
+            Utc::now() + Duration::hours(1),
+            None,
+            None,
+        )
         .await
         .unwrap();
     store
@@ -167,7 +179,13 @@ async fn no_subscriptions_means_no_sends() {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let addr = "empty@example.com";
     store
-        .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+        .create_mailbox(
+            addr,
+            "example.com",
+            Utc::now() + Duration::hours(1),
+            None,
+            None,
+        )
         .await
         .unwrap();
 
@@ -181,7 +199,13 @@ async fn subscriptions_route_to_the_sender_for_their_kind() {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let addr = "mixed@example.com";
     store
-        .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+        .create_mailbox(
+            addr,
+            "example.com",
+            Utc::now() + Duration::hours(1),
+            None,
+            None,
+        )
         .await
         .unwrap();
     store
@@ -222,7 +246,13 @@ async fn unconfigured_kind_is_skipped_and_kept() {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let addr = "apnsonly@example.com";
     store
-        .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+        .create_mailbox(
+            addr,
+            "example.com",
+            Utc::now() + Duration::hours(1),
+            None,
+            None,
+        )
         .await
         .unwrap();
     store
@@ -248,7 +278,13 @@ async fn apns_gone_tokens_are_pruned() {
     let store: Arc<dyn Store> = Arc::new(MemoryStore::new());
     let addr = "apns@example.com";
     store
-        .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+        .create_mailbox(
+            addr,
+            "example.com",
+            Utc::now() + Duration::hours(1),
+            None,
+            None,
+        )
         .await
         .unwrap();
     store

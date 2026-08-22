@@ -279,8 +279,25 @@ impl Session {
         let Some((_, domain)) = addr.rsplit_once('@') else {
             return RecipientCheck::NotOurDomain;
         };
-        if domain.is_empty() || !self.ctx.config.accepts_domain(domain) {
+        if domain.is_empty() {
             return RecipientCheck::NotOurDomain;
+        }
+
+        // Accepted domains: the configured list, plus verified custom domains
+        // (docs/11) when the feature is on.
+        let is_config_domain = self.ctx.config.accepts_domain(domain);
+        if !is_config_domain {
+            if !self.ctx.config.custom_domains_enabled {
+                return RecipientCheck::NotOurDomain;
+            }
+            match self.ctx.store.custom_domain_is_verified(domain).await {
+                Ok(true) => {}
+                Ok(false) => return RecipientCheck::NotOurDomain,
+                Err(e) => {
+                    warn!(error = %e, domain = %domain, "custom domain lookup failed");
+                    return RecipientCheck::Error;
+                }
+            }
         }
 
         // U1 plus-addressing: `user+tag@` delivers to `user@`.
@@ -292,7 +309,10 @@ impl Session {
             .await
         {
             Ok(true) => RecipientCheck::Accept(delivery),
-            Ok(false) => self.try_catch_all(delivery).await,
+            // Catch-all never applies to custom domains: only mailboxes the
+            // claim-token holder explicitly created may receive mail.
+            Ok(false) if is_config_domain => self.try_catch_all(delivery).await,
+            Ok(false) => RecipientCheck::NoMailbox,
             Err(e) => {
                 warn!(error = %e, address = %delivery, "mailbox lookup failed");
                 RecipientCheck::Error
@@ -320,7 +340,7 @@ impl Session {
         match self
             .ctx
             .store
-            .create_mailbox(&delivery, domain, Utc::now() + ttl, None)
+            .create_mailbox(&delivery, domain, Utc::now() + ttl, None, None)
             .await
         {
             Ok(_) => {

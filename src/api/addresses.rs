@@ -8,9 +8,11 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::auth::{authorize_owner, generate_owner_token};
+use super::auth::{authorize_owner, generate_owner_token, hash_token};
 use super::limits::client_ip;
 use super::{ApiError, AppState, is_unique_violation};
+use crate::config::TierPolicy;
+use crate::entitlements::Tier;
 use crate::model::Mailbox;
 
 const LOCAL_PART_CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -57,13 +59,50 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<CreateAddressResponse>), ApiError> {
     let req = body.map(|Json(b)| b).unwrap_or_default();
 
+    // Attestation gate (docs/09) and tier gate (docs/10), from one token
+    // parse. Tier is `None` unless ENTITLEMENTS_ENFORCED; the device hash is
+    // recorded whenever the token is attested, scoping per-device caps.
+    let client = super::entitlements::attestation_gate(&state, &headers)?;
+    let policy: Option<&TierPolicy> = state.config.entitlements_enforced.then(|| {
+        let tier = client.as_ref().map(|c| c.tier).unwrap_or(Tier::Free);
+        state.config.tier_policy(tier)
+    });
+    let device_hash = client
+        .as_ref()
+        .and_then(|c| c.kid.as_deref())
+        .map(hash_token);
+
     let domain = match req.domain {
         Some(d) => {
             let d = d.trim().to_ascii_lowercase();
-            if !state.config.accepts_domain(&d) {
+            if let Some(index) = state.config.domains.iter().position(|x| x == &d) {
+                if let Some(policy) = policy {
+                    // FREE_DOMAIN_COUNT: only the first N configured domains
+                    // (0 = all) are usable on this tier.
+                    if policy.domain_count > 0 && index >= policy.domain_count as usize {
+                        return Err(ApiError::pro_required(format!(
+                            "domain requires a higher tier: {d}"
+                        )));
+                    }
+                }
+                d
+            } else if state.config.custom_domains_enabled {
+                if let Some(policy) = policy
+                    && !policy.custom_domains
+                {
+                    return Err(ApiError::pro_required(
+                        "custom domains require a higher tier",
+                    ));
+                }
+                // docs/11: a verified custom domain works too, but only for
+                // whoever holds its claim token — otherwise anyone could mint
+                // mailboxes on someone else's domain.
+                super::custom_domains::authorize_mailbox_on_custom_domain(&state, &d, &headers)
+                    .await?;
+                d
+            } else {
                 return Err(ApiError::BadRequest(format!("unknown domain: {d}")));
             }
-            d
         }
         None => state.config.domains[0].clone(),
     };
@@ -84,10 +123,35 @@ pub async fn create(
                     "local_part is reserved: {local}"
                 )));
             }
+            if let Some(policy) = policy
+                && !policy.custom_local_parts
+            {
+                return Err(ApiError::pro_required(
+                    "custom local parts require a higher tier",
+                ));
+            }
             Some(local)
         }
         None => None,
     };
+
+    // Per-device active-mailbox cap (docs/10 phase 2), enforceable only when
+    // the request proves which device it is (attested token). Checked before
+    // the daily IP quota so a capped create does not burn quota.
+    if let (Some(policy), Some(hash)) = (policy, device_hash.as_deref())
+        && policy.active_mailboxes > 0
+    {
+        let active = state
+            .store
+            .count_active_mailboxes_by_device(hash, Utc::now())
+            .await?;
+        if active >= u64::from(policy.active_mailboxes) {
+            return Err(ApiError::mailbox_cap(format!(
+                "this tier allows {} active mailboxes per device",
+                policy.active_mailboxes
+            )));
+        }
+    }
 
     // Per-IP daily creation quota (A3): every mailbox is a real, spammable
     // resource, so cap how many one client can mint per day.
@@ -110,7 +174,13 @@ pub async fn create(
         let address = format!("{local}@{domain}");
         return match state
             .store
-            .create_mailbox(&address, &domain, expires_at, Some(&token_hash))
+            .create_mailbox(
+                &address,
+                &domain,
+                expires_at,
+                Some(&token_hash),
+                device_hash.as_deref(),
+            )
             .await
         {
             Ok(mailbox) => Ok((
@@ -133,7 +203,13 @@ pub async fn create(
         let address = format!("{}@{}", random_local_part(), domain);
         match state
             .store
-            .create_mailbox(&address, &domain, expires_at, Some(&token_hash))
+            .create_mailbox(
+                &address,
+                &domain,
+                expires_at,
+                Some(&token_hash),
+                device_hash.as_deref(),
+            )
             .await
         {
             Ok(mailbox) => {
@@ -168,15 +244,35 @@ pub async fn get(
 
 /// `POST /api/addresses/{address}/extend` - push expiry back by the default
 /// TTL. Owner-token gated (A2); the token itself is unchanged by design.
+///
+/// Under entitlements (docs/10) the total lifetime — new expiry minus
+/// creation — is capped per tier (`*_MAX_LIFETIME_SECONDS`, 0 = unlimited).
+/// A ceiling, not an extend counter: manual extends stay free, but only pro
+/// keeps a mailbox alive past the free window.
 pub async fn extend(
     State(state): State<AppState>,
     Path(address): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Mailbox>, ApiError> {
     let address = address.to_ascii_lowercase();
-    authorize_owner(&state, &address, &headers).await?;
+    super::entitlements::attestation_gate(&state, &headers)?;
+    let mailbox = authorize_owner(&state, &address, &headers).await?;
     let ttl = Duration::seconds(state.config.default_ttl.as_secs() as i64);
     let new_expiry = Utc::now() + ttl;
+
+    if let Some(tier) = super::entitlements::enforced_tier(&state, &headers)? {
+        let policy = state.config.tier_policy(tier);
+        if policy.max_lifetime_seconds > 0
+            && new_expiry - mailbox.created_at
+                > Duration::seconds(policy.max_lifetime_seconds as i64)
+        {
+            return Err(ApiError::lifetime_cap(format!(
+                "extending would exceed this tier's max mailbox lifetime of {}s",
+                policy.max_lifetime_seconds
+            )));
+        }
+    }
+
     match state.store.extend_mailbox(&address, new_expiry).await? {
         Some(mb) => Ok(Json(mb)),
         None => Err(ApiError::NotFound("mailbox not found".to_string())),
@@ -191,6 +287,7 @@ pub async fn delete(
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let address = address.to_ascii_lowercase();
+    super::entitlements::attestation_gate(&state, &headers)?;
     authorize_owner(&state, &address, &headers).await?;
     if state.store.delete_mailbox(&address).await? {
         Ok(StatusCode::NO_CONTENT)
@@ -207,6 +304,7 @@ pub async fn rotate(
     headers: HeaderMap,
 ) -> Result<Json<RotateTokenResponse>, ApiError> {
     let address = address.to_ascii_lowercase();
+    super::entitlements::attestation_gate(&state, &headers)?;
     authorize_owner(&state, &address, &headers).await?;
     let (owner_token, token_hash) = generate_owner_token();
     if state

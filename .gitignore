@@ -9,6 +9,8 @@
 *.pem
 *.key
 *.crt
+# ...but Apple's public App Attest root CA is embedded into the binary
+!src/apple_app_attest_root_ca.pem
 
 # Editor / OS cruft
 .vscode/

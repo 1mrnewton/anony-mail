@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anony_mail::api::is_unique_violation;
-use anony_mail::model::{NewAttachment, NewMessage, SubscriptionKind};
+use anony_mail::model::{CustomDomainStatus, NewAttachment, NewMessage, SubscriptionKind};
 use anony_mail::store::{MailboxQuotas, MemoryStore, SqliteStore, Store, SubscriptionLimit};
 use chrono::{Duration, Utc};
 
@@ -93,7 +93,7 @@ async fn mailbox_lifecycle_create_get_extend_delete() {
         let expires = Utc::now() + Duration::hours(1);
 
         let created = store
-            .create_mailbox(addr, "example.com", expires, None)
+            .create_mailbox(addr, "example.com", expires, None, None)
             .await
             .unwrap_or_else(|e| panic!("[{}] create failed: {e}", ts.name));
         assert_eq!(created.address, addr, "[{}]", ts.name);
@@ -153,11 +153,11 @@ async fn duplicate_mailbox_is_a_unique_violation() {
         let expires = Utc::now() + Duration::hours(1);
 
         store
-            .create_mailbox(addr, "example.com", expires, None)
+            .create_mailbox(addr, "example.com", expires, None, None)
             .await
             .unwrap();
         let err = store
-            .create_mailbox(addr, "example.com", expires, None)
+            .create_mailbox(addr, "example.com", expires, None, None)
             .await
             .err()
             .unwrap_or_else(|| panic!("[{}] second create of the same address must fail", ts.name));
@@ -175,7 +175,13 @@ async fn message_round_trip_and_cascade_on_mailbox_delete() {
         let store = &ts.store;
         let addr = "inbox@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -217,6 +223,7 @@ async fn message_round_trip_and_cascade_on_mailbox_delete() {
                 "example.com",
                 Utc::now() + Duration::hours(1),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -252,7 +259,13 @@ async fn delete_single_message() {
         let store = &ts.store;
         let addr = "inbox@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let stored = store
@@ -292,6 +305,7 @@ async fn purge_removes_only_expired_mailboxes() {
                 "example.com",
                 Utc::now() - Duration::minutes(5),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -300,6 +314,7 @@ async fn purge_removes_only_expired_mailboxes() {
                 "fresh@example.com",
                 "example.com",
                 Utc::now() + Duration::hours(1),
+                None,
                 None,
             )
             .await
@@ -351,7 +366,7 @@ async fn owner_token_hash_roundtrip_and_rotate() {
         let expires = Utc::now() + Duration::hours(1);
 
         let created = store
-            .create_mailbox(addr, "example.com", expires, Some("hash-v1"))
+            .create_mailbox(addr, "example.com", expires, Some("hash-v1"), None)
             .await
             .unwrap();
         assert_eq!(
@@ -400,7 +415,13 @@ async fn push_subscription_crud_cap_and_cascade() {
         let store = &ts.store;
         let addr = "inbox@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -494,7 +515,13 @@ async fn subscription_kinds_roundtrip_and_share_the_cap() {
         let store = &ts.store;
         let addr = "iphone@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -576,7 +603,13 @@ async fn purge_removes_push_subscriptions() {
         let store = &ts.store;
         let addr = "doomed@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() - Duration::minutes(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() - Duration::minutes(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
         store
@@ -611,7 +644,13 @@ async fn message_count_quota_drops_oldest() {
         let store = &ts.store;
         let addr = "inbox@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -642,7 +681,13 @@ async fn mailbox_byte_quota_drops_oldest_but_keeps_newest() {
         let store = &ts.store;
         let addr = "inbox@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -683,7 +728,13 @@ async fn list_messages_newest_first() {
         let store = &ts.store;
         let addr = "inbox@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -716,7 +767,13 @@ async fn raw_message_roundtrip() {
         let store = &ts.store;
         let addr = "raw@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -778,7 +835,13 @@ async fn mark_seen_roundtrip() {
         let store = &ts.store;
         let addr = "seen@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let saved = store
@@ -831,7 +894,13 @@ async fn delete_all_messages_clears_inbox_keeps_mailbox() {
         let store = &ts.store;
         let addr = "clear@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -892,7 +961,13 @@ async fn pagination_limit_and_since_cursor() {
         let store = &ts.store;
         let addr = "page@example.com";
         store
-            .create_mailbox(addr, "example.com", Utc::now() + Duration::hours(1), None)
+            .create_mailbox(
+                addr,
+                "example.com",
+                Utc::now() + Duration::hours(1),
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -949,6 +1024,132 @@ async fn pagination_limit_and_since_cursor() {
             ghost.len(),
             5,
             "[{}] vanished cursor = newest page",
+            ts.name
+        );
+    }
+}
+
+#[tokio::test]
+async fn custom_domain_lifecycle_and_recheck_listing() {
+    for ts in all_stores().await {
+        let store = &ts.store;
+        let domain = "corp.example";
+
+        // Claim: pending, secrets round-trip, timestamps empty.
+        let created = store
+            .create_custom_domain(domain, "hash-1", "tok-1")
+            .await
+            .unwrap();
+        assert_eq!(created.domain, domain, "[{}]", ts.name);
+        assert_eq!(created.status, CustomDomainStatus::Pending, "[{}]", ts.name);
+
+        let dup = store
+            .create_custom_domain(domain, "hash-2", "tok-2")
+            .await
+            .expect_err("duplicate claim must fail");
+        assert!(
+            is_unique_violation(&dup),
+            "[{}] duplicate claim is a unique violation",
+            ts.name
+        );
+
+        let got = store.get_custom_domain(domain).await.unwrap().unwrap();
+        assert_eq!(got.claim_token_hash, "hash-1", "[{}]", ts.name);
+        assert_eq!(got.txt_token, "tok-1", "[{}]", ts.name);
+        assert!(
+            got.verified_at.is_none() && got.last_checked_at.is_none(),
+            "[{}]",
+            ts.name
+        );
+        assert!(
+            !store.custom_domain_is_verified(domain).await.unwrap(),
+            "[{}] pending is not verified",
+            ts.name
+        );
+        assert!(
+            store
+                .list_custom_domains_to_recheck(Utc::now())
+                .await
+                .unwrap()
+                .is_empty(),
+            "[{}] pending domains are never re-check candidates",
+            ts.name
+        );
+
+        // Successful check: verified + anchors set.
+        let now = Utc::now();
+        assert!(
+            store
+                .record_custom_domain_check(domain, CustomDomainStatus::Verified, Some(now), now)
+                .await
+                .unwrap(),
+            "[{}]",
+            ts.name
+        );
+        assert!(
+            store.custom_domain_is_verified(domain).await.unwrap(),
+            "[{}]",
+            ts.name
+        );
+        let got = store.get_custom_domain(domain).await.unwrap().unwrap();
+        assert_eq!(got.status, CustomDomainStatus::Verified, "[{}]", ts.name);
+        let anchor = got.verified_at.expect("verified_at set");
+        let checked = got.last_checked_at.expect("last_checked_at set");
+        assert!(
+            (anchor - now).abs() < Duration::seconds(1)
+                && (checked - now).abs() < Duration::seconds(1),
+            "[{}] timestamps round-trip",
+            ts.name
+        );
+
+        // Re-check listing honors the cutoff against last_checked_at.
+        let due = store
+            .list_custom_domains_to_recheck(now + Duration::seconds(2))
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1, "[{}] stale verified domain is due", ts.name);
+        assert!(
+            store
+                .list_custom_domains_to_recheck(now - Duration::seconds(60))
+                .await
+                .unwrap()
+                .is_empty(),
+            "[{}] freshly checked domain is not due",
+            ts.name
+        );
+
+        // Failed domains stay in the re-check pool (they can heal).
+        assert!(
+            store
+                .record_custom_domain_check(domain, CustomDomainStatus::Failed, Some(now), now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store.custom_domain_is_verified(domain).await.unwrap(),
+            "[{}] failed is not verified",
+            ts.name
+        );
+        let due = store
+            .list_custom_domains_to_recheck(now + Duration::seconds(2))
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1, "[{}] failed domain is due", ts.name);
+
+        // Delete: idempotent, and recording on a missing domain reports it.
+        assert!(store.delete_custom_domain(domain).await.unwrap());
+        assert!(!store.delete_custom_domain(domain).await.unwrap());
+        assert!(
+            store.get_custom_domain(domain).await.unwrap().is_none(),
+            "[{}]",
+            ts.name
+        );
+        assert!(
+            !store
+                .record_custom_domain_check(domain, CustomDomainStatus::Verified, Some(now), now)
+                .await
+                .unwrap(),
+            "[{}] recording a check on a vanished domain returns false",
             ts.name
         );
     }

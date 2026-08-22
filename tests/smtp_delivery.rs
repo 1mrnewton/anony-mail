@@ -67,6 +67,7 @@ async fn delivers_message_to_valid_recipient() {
             Utc::now() + chrono::Duration::hours(1),
             // Ownerless is fine here; SMTP delivery ignores tokens.
             None,
+            None,
         )
         .await
         .unwrap();
@@ -179,6 +180,7 @@ async fn oversize_data_rejected_with_552_and_not_stored() {
             "test.local",
             Utc::now() + chrono::Duration::hours(1),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -250,6 +252,7 @@ async fn dot_stuffed_lines_are_unstuffed_in_stored_body() {
             "user@test.local",
             "test.local",
             Utc::now() + chrono::Duration::hours(1),
+            None,
             None,
         )
         .await
@@ -346,6 +349,7 @@ async fn raw_bytes_retained_only_when_enabled() {
                 "test.local",
                 Utc::now() + chrono::Duration::hours(1),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -414,6 +418,7 @@ async fn plus_addressed_mail_lands_in_base_mailbox() {
             "user@test.local",
             "test.local",
             Utc::now() + chrono::Duration::hours(1),
+            None,
             None,
         )
         .await
@@ -578,5 +583,176 @@ async fn rejects_message_with_no_valid_recipients() {
     send(&mut write_half, "QUIT").await;
     assert!(read_reply(&mut reader).await.starts_with("221"));
 
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+}
+
+/// Custom domains (docs/11): RCPT accepts mail for a *verified* custom
+/// domain's existing mailboxes only — no catch-all even when it is enabled
+/// for the server's own domains, and unverified claims stay foreign.
+#[tokio::test]
+async fn custom_domain_recipients_gated_on_verification() {
+    use anony_mail::model::CustomDomainStatus;
+
+    let mut config = test_config();
+    // Catch-all ON, to prove it never applies to custom domains.
+    config.catch_all_enabled = true;
+    let config = Arc::new(config);
+    let store = Arc::new(MemoryStore::new());
+    let events = EventBus::new(16);
+
+    // corp.example: verified claim with one explicitly created mailbox.
+    let now = Utc::now();
+    store
+        .create_custom_domain("corp.example", "hash", "tok")
+        .await
+        .unwrap();
+    store
+        .record_custom_domain_check("corp.example", CustomDomainStatus::Verified, Some(now), now)
+        .await
+        .unwrap();
+    store
+        .create_mailbox(
+            "jane@corp.example",
+            "corp.example",
+            now + chrono::Duration::hours(1),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // pending.example: claimed but never verified.
+    store
+        .create_custom_domain("pending.example", "hash2", "tok2")
+        .await
+        .unwrap();
+
+    let ctx = SmtpContext {
+        store: (store.clone() as Arc<dyn Store>),
+        config,
+        events,
+        tls_acceptor: None,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, peer) = listener.accept().await.unwrap();
+        let _ = anony_mail::smtp::session::handle(socket, peer, ctx).await;
+    });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.split();
+    let mut reader = BufReader::new(read_half);
+
+    assert!(read_reply(&mut reader).await.starts_with("220"));
+    send(&mut write_half, "EHLO client.test").await;
+    assert!(read_reply(&mut reader).await.starts_with("250"));
+    send(&mut write_half, "MAIL FROM:<sender@elsewhere.test>").await;
+    assert!(read_reply(&mut reader).await.starts_with("250"));
+
+    // Existing mailbox on a verified custom domain -> accepted.
+    send(&mut write_half, "RCPT TO:<jane@corp.example>").await;
+    assert!(read_reply(&mut reader).await.starts_with("250"));
+
+    // Unknown local part on the custom domain -> refused (catch-all is on,
+    // but must not conjure mailboxes on someone's own domain).
+    send(&mut write_half, "RCPT TO:<stranger@corp.example>").await;
+    assert!(read_reply(&mut reader).await.starts_with("550"));
+
+    // Unverified claim -> treated as a foreign domain.
+    send(&mut write_half, "RCPT TO:<jane@pending.example>").await;
+    assert!(read_reply(&mut reader).await.starts_with("550"));
+
+    send(&mut write_half, "DATA").await;
+    assert!(read_reply(&mut reader).await.starts_with("354"));
+    for line in [
+        "From: Sender <sender@elsewhere.test>",
+        "Subject: To a custom domain",
+        "",
+        "Hello custom domain!",
+        ".",
+    ] {
+        send(&mut write_half, line).await;
+    }
+    assert!(read_reply(&mut reader).await.starts_with("250"));
+
+    send(&mut write_half, "QUIT").await;
+    assert!(read_reply(&mut reader).await.starts_with("221"));
+    let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+
+    let summaries = store
+        .list_messages("jane@corp.example", 0, None)
+        .await
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].subject.as_deref(), Some("To a custom domain"));
+    // The catch-all must not have created the stranger mailbox.
+    assert!(
+        store
+            .get_mailbox("stranger@corp.example")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// With `CUSTOM_DOMAINS_ENABLED=false`, even a verified claim in the store
+/// is ignored by RCPT.
+#[tokio::test]
+async fn custom_domains_disabled_rejects_verified_claims() {
+    use anony_mail::model::CustomDomainStatus;
+
+    let mut config = test_config();
+    config.custom_domains_enabled = false;
+    let config = Arc::new(config);
+    let store = Arc::new(MemoryStore::new());
+    let events = EventBus::new(16);
+
+    let now = Utc::now();
+    store
+        .create_custom_domain("corp.example", "hash", "tok")
+        .await
+        .unwrap();
+    store
+        .record_custom_domain_check("corp.example", CustomDomainStatus::Verified, Some(now), now)
+        .await
+        .unwrap();
+    store
+        .create_mailbox(
+            "jane@corp.example",
+            "corp.example",
+            now + chrono::Duration::hours(1),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let ctx = SmtpContext {
+        store: (store.clone() as Arc<dyn Store>),
+        config,
+        events,
+        tls_acceptor: None,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, peer) = listener.accept().await.unwrap();
+        let _ = anony_mail::smtp::session::handle(socket, peer, ctx).await;
+    });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let (read_half, mut write_half) = stream.split();
+    let mut reader = BufReader::new(read_half);
+
+    assert!(read_reply(&mut reader).await.starts_with("220"));
+    send(&mut write_half, "EHLO client.test").await;
+    assert!(read_reply(&mut reader).await.starts_with("250"));
+    send(&mut write_half, "MAIL FROM:<sender@elsewhere.test>").await;
+    assert!(read_reply(&mut reader).await.starts_with("250"));
+    send(&mut write_half, "RCPT TO:<jane@corp.example>").await;
+    assert!(read_reply(&mut reader).await.starts_with("550"));
+
+    send(&mut write_half, "QUIT").await;
+    assert!(read_reply(&mut reader).await.starts_with("221"));
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 }

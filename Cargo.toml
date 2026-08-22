@@ -39,3 +39,20 @@ base64 = "0.23.1"
 web-push = { version = "0.11.0", default-features = false, features = ["hyper-client"] }
 regex = "1.13.1"
 a2 = "0.10.0"
+hickory-resolver = "0.26.1"
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["rust_crypto"] }
+# rustls-no-provider: the process installs the `ring` provider explicitly (see
+# entitlements.rs) so reqwest itself never pulls a second TLS stack. (appattest
+# below does depend on aws-lc-rs for its cert-chain checks, which needs cmake
+# at build time — see Dockerfile.)
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# App Attest verification (docs/09), fully local — default `reqwest` feature
+# off because we embed Apple's root CA instead of fetching it.
+appattest = { version = "0.1.1", default-features = false }
+# Only to read the assertion counter out of the CBOR (appattest verifies but
+# does not expose it); already in the tree via appattest.
+minicbor = "0.25"
+
+[dev-dependencies]
+appattest = { version = "0.1.1", default-features = false, features = ["testing"] }

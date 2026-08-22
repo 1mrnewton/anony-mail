@@ -53,6 +53,7 @@ async fn owned_mailbox(state: &AppState, addr: &str) {
             "example.com",
             Utc::now() + Duration::hours(1),
             Some(&hash),
+            None,
         )
         .await
         .unwrap();

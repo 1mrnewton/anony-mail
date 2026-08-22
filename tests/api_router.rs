@@ -157,6 +157,18 @@ async fn liveness_and_readiness_probes() {
 }
 
 #[tokio::test]
+async fn capabilities_reports_enabled_features() {
+    // Default test config: no push credentials, custom domains on by default.
+    let (app, _) = test_state();
+    let response = app.oneshot(req("GET", "/api/capabilities")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = json_body(response).await;
+    assert_eq!(body["apns_push"], false);
+    assert_eq!(body["web_push"], false);
+    assert_eq!(body["custom_domains"], true);
+}
+
+#[tokio::test]
 async fn create_list_read_clear_lifecycle() {
     let (app, store) = test_state();
 
@@ -253,6 +265,7 @@ async fn pagination_params_are_honored_and_validated() {
             "example.com",
             Utc::now() + chrono::Duration::hours(1),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -305,6 +318,7 @@ async fn attachment_download_is_hardened() {
             "example.com",
             Utc::now() + chrono::Duration::hours(1),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -340,6 +354,7 @@ async fn raw_download_served_as_rfc822() {
             "raw@example.com",
             "example.com",
             Utc::now() + chrono::Duration::hours(1),
+            None,
             None,
         )
         .await

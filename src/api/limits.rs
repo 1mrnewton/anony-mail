@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::http::HeaderMap;
 use chrono::NaiveDate;
@@ -23,6 +24,14 @@ pub struct RuntimeLimits {
     /// Per-IP daily address creation cap; 0 disables.
     daily_create_cap: u32,
     created_today: Mutex<HashMap<IpAddr, (NaiveDate, u32)>>,
+    /// Per-IP daily custom-domain claim cap; 0 disables.
+    daily_domain_cap: u32,
+    domains_today: Mutex<HashMap<IpAddr, (NaiveDate, u32)>>,
+    /// Min spacing between DNS verification runs per custom domain (docs/11)
+    /// — each run costs live DNS lookups. Zero disables.
+    domain_verify_min_interval: Duration,
+    /// Last verification run per custom domain, for the per-domain throttle.
+    domain_verify_last: Mutex<HashMap<String, Instant>>,
 }
 
 impl RuntimeLimits {
@@ -34,6 +43,10 @@ impl RuntimeLimits {
             sse_per_ip: Arc::new(Mutex::new(HashMap::new())),
             daily_create_cap: config.max_addresses_per_ip_per_day,
             created_today: Mutex::new(HashMap::new()),
+            daily_domain_cap: config.max_custom_domains_per_ip_per_day,
+            domains_today: Mutex::new(HashMap::new()),
+            domain_verify_min_interval: config.custom_domain_verify_throttle,
+            domain_verify_last: Mutex::new(HashMap::new()),
         }
     }
 
@@ -68,27 +81,79 @@ impl RuntimeLimits {
     /// Record an address-creation attempt from `ip` on `today` (UTC). Returns
     /// false when the daily quota is exhausted.
     pub fn note_address_created(&self, ip: IpAddr, today: NaiveDate) -> bool {
-        if self.daily_create_cap == 0 {
+        note_daily(
+            &self.created_today,
+            self.daily_create_cap,
+            ip,
+            today,
+            "daily create mutex poisoned",
+        )
+    }
+
+    /// Record a custom-domain claim from `ip` on `today` (UTC). Returns false
+    /// when the daily quota is exhausted.
+    pub fn note_domain_created(&self, ip: IpAddr, today: NaiveDate) -> bool {
+        note_daily(
+            &self.domains_today,
+            self.daily_domain_cap,
+            ip,
+            today,
+            "daily domain mutex poisoned",
+        )
+    }
+
+    /// Reserve a verification run for `domain` (must be lowercase). Returns
+    /// false when a run happened within the throttle window — DNS checks are
+    /// expensive-ish and pointless to hammer.
+    pub fn try_begin_domain_verify(&self, domain: &str) -> bool {
+        if self.domain_verify_min_interval.is_zero() {
             return true;
         }
-        let mut created = self
-            .created_today
+        let now = Instant::now();
+        let mut last = self
+            .domain_verify_last
             .lock()
-            .expect("daily create mutex poisoned");
-        // Bound memory: drop stale entries once the table grows large.
-        if created.len() > 100_000 {
-            created.retain(|_, (day, _)| *day == today);
+            .expect("domain verify mutex poisoned");
+        // Bound memory: entries older than the throttle window are useless.
+        if last.len() > 10_000 {
+            last.retain(|_, at| now.duration_since(*at) < self.domain_verify_min_interval);
         }
-        let entry = created.entry(ip).or_insert((today, 0));
-        if entry.0 != today {
-            *entry = (today, 0);
+        match last.get(domain) {
+            Some(at) if now.duration_since(*at) < self.domain_verify_min_interval => false,
+            _ => {
+                last.insert(domain.to_string(), now);
+                true
+            }
         }
-        if entry.1 >= self.daily_create_cap {
-            false
-        } else {
-            entry.1 += 1;
-            true
-        }
+    }
+}
+
+/// Shared per-IP daily counter: true while `ip` is under `cap` for `today`,
+/// incrementing on success. A `cap` of 0 disables the limit.
+fn note_daily(
+    table: &Mutex<HashMap<IpAddr, (NaiveDate, u32)>>,
+    cap: u32,
+    ip: IpAddr,
+    today: NaiveDate,
+    poison_msg: &str,
+) -> bool {
+    if cap == 0 {
+        return true;
+    }
+    let mut counters = table.lock().expect(poison_msg);
+    // Bound memory: drop stale entries once the table grows large.
+    if counters.len() > 100_000 {
+        counters.retain(|_, (day, _)| *day == today);
+    }
+    let entry = counters.entry(ip).or_insert((today, 0));
+    if entry.0 != today {
+        *entry = (today, 0);
+    }
+    if entry.1 >= cap {
+        false
+    } else {
+        entry.1 += 1;
+        true
     }
 }
 

@@ -43,6 +43,18 @@ services:
       APNS_KEY_BASE64: ${APNS_KEY_BASE64:-}
       APNS_KEY_PATH: ${APNS_KEY_PATH:-}
       APNS_SANDBOX: ${APNS_SANDBOX:-false}
+      # Custom domains (on by default; see .env.example).
+      CUSTOM_DOMAINS_ENABLED: ${CUSTOM_DOMAINS_ENABLED:-true}
+      # Entitlements / tiers (hosted instances; empty = fully open self-host).
+      # Tune FREE_*/PRO_* policy by adding those keys here the same way.
+      ENTITLEMENTS_ENFORCED: ${ENTITLEMENTS_ENFORCED:-false}
+      TOKEN_SIGNING_KEY: ${TOKEN_SIGNING_KEY:-}
+      REVENUECAT_SECRET_KEY: ${REVENUECAT_SECRET_KEY:-}
+      REVENUECAT_ENTITLEMENT_ID: ${REVENUECAT_ENTITLEMENT_ID:-Anony Mail Pro}
+      # App Attest client attestation (hosted instances).
+      APP_ATTEST_TEAM_ID: ${APP_ATTEST_TEAM_ID:-}
+      APP_ATTEST_BUNDLE_ID: ${APP_ATTEST_BUNDLE_ID:-}
+      CLIENT_ATTESTATION_REQUIRED: ${CLIENT_ATTESTATION_REQUIRED:-false}
     volumes:
       - maildata:/data
     expose:

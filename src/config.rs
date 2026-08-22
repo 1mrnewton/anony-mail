@@ -48,6 +48,26 @@ pub enum DbBackend {
     Postgres,
 }
 
+/// What one tier is allowed to do (docs/10). Serialized verbatim into
+/// `GET /api/capabilities` so clients drive their gates and paywall copy from
+/// the server's numbers instead of hardcoded constants.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TierPolicy {
+    /// Active-mailbox cap per attested device. `0` = unlimited. Enforced only
+    /// for requests that prove which device they come from (attested token).
+    pub active_mailboxes: u32,
+    /// Ceiling on `expires_at - created_at`, including extends. `0` =
+    /// unlimited.
+    pub max_lifetime_seconds: u64,
+    /// May pick the local part instead of getting a random one.
+    pub custom_local_parts: bool,
+    /// How many of the configured domains are usable, counted from the front
+    /// of `DOMAINS`. `0` = all.
+    pub domain_count: u32,
+    /// May claim bring-your-own domains.
+    pub custom_domains: bool,
+}
+
 /// Runtime configuration, loaded from environment variables.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -144,11 +164,51 @@ pub struct Config {
     /// local part on an accepted domain (U1). Never applies to reserved local
     /// parts. Off by default.
     pub catch_all_enabled: bool,
+    /// Custom domains (docs/11): let clients claim their own domain, prove it
+    /// via DNS (TXT + MX), and receive mail on it. On by default.
+    pub custom_domains_enabled: bool,
+    /// Max custom-domain claims a single IP may create per UTC day (0
+    /// disables).
+    pub max_custom_domains_per_ip_per_day: u32,
+    /// Min spacing between DNS verification runs for one custom domain (0
+    /// disables the throttle).
+    pub custom_domain_verify_throttle: Duration,
     /// U2: retain the original RFC 5322 bytes of each delivered message and
     /// serve them via `GET .../messages/{id}/raw`. Off by default (roughly
     /// doubles per-message storage; the A4 byte quota already counts
     /// `raw_size`, so quotas need no adjustment).
     pub store_raw_message: bool,
+    /// Enforce free/pro tiers server-side (docs/10). Off by default: the
+    /// self-host experience is everything-on with no tokens required.
+    pub entitlements_enforced: bool,
+    /// Key for signing client tokens (HS256), decoded from the base64
+    /// `TOKEN_SIGNING_KEY`. Required when entitlements are enforced; also the
+    /// availability switch for `POST /api/entitlements/verify`.
+    pub token_signing_key: Option<Vec<u8>>,
+    /// RevenueCat secret API key. Enables pro verification; without it every
+    /// client is free tier.
+    pub revenuecat_secret_key: Option<String>,
+    /// RevenueCat entitlement identifier that marks a subscriber as pro.
+    pub revenuecat_entitlement_id: String,
+    /// Require an attested client token (App Attest, docs/09) on every
+    /// mutating route. Off by default: self-hosted servers stay fully open.
+    pub client_attestation_required: bool,
+    /// Apple Developer Team ID for App Attest (e.g. `FR82ZG29F6`). App Attest
+    /// is configured only when team ID and bundle ID are both set.
+    pub app_attest_team_id: Option<String>,
+    /// The app's bundle ID for App Attest (e.g. `com.scytheralpha.anonymail`).
+    pub app_attest_bundle_id: Option<String>,
+    /// PEM of the root CA that attestation cert chains must anchor to,
+    /// loaded from `APP_ATTEST_ROOT_CA_PATH`. `None` uses the Apple App
+    /// Attestation Root CA embedded at build time (valid to 2045); the
+    /// override exists for rotation and for tests, which anchor to a
+    /// synthetic CA.
+    pub app_attest_root_pem: Option<Vec<u8>>,
+    /// What free-tier clients may do when enforcement is on.
+    pub free_tier: TierPolicy,
+    /// What pro-tier clients may do. Pro caps are abuse ceilings, not sales
+    /// gates.
+    pub pro_tier: TierPolicy,
 }
 
 #[derive(Debug, Clone)]
@@ -201,7 +261,32 @@ impl Default for Config {
             apns_topic: None,
             apns_sandbox: false,
             catch_all_enabled: false,
+            custom_domains_enabled: true,
+            max_custom_domains_per_ip_per_day: 5,
+            custom_domain_verify_throttle: Duration::from_secs(10),
             store_raw_message: false,
+            entitlements_enforced: false,
+            token_signing_key: None,
+            revenuecat_secret_key: None,
+            revenuecat_entitlement_id: "Anony Mail Pro".to_string(),
+            client_attestation_required: false,
+            app_attest_team_id: None,
+            app_attest_bundle_id: None,
+            app_attest_root_pem: None,
+            free_tier: TierPolicy {
+                active_mailboxes: 5,
+                max_lifetime_seconds: 86_400, // 24h
+                custom_local_parts: false,
+                domain_count: 1,
+                custom_domains: false,
+            },
+            pro_tier: TierPolicy {
+                active_mailboxes: 50,
+                max_lifetime_seconds: 0,
+                custom_local_parts: true,
+                domain_count: 0,
+                custom_domains: true,
+            },
         }
     }
 }
@@ -374,7 +459,93 @@ impl Config {
         let apns_sandbox = parse_env("APNS_SANDBOX", base.apns_sandbox)?;
 
         let catch_all_enabled = parse_env("CATCH_ALL_ENABLED", base.catch_all_enabled)?;
+        let custom_domains_enabled =
+            parse_env("CUSTOM_DOMAINS_ENABLED", base.custom_domains_enabled)?;
+        let max_custom_domains_per_ip_per_day = parse_env(
+            "MAX_CUSTOM_DOMAINS_PER_IP_PER_DAY",
+            base.max_custom_domains_per_ip_per_day,
+        )?;
+        let custom_domain_verify_throttle = Duration::from_secs(parse_env(
+            "CUSTOM_DOMAIN_VERIFY_THROTTLE_SECONDS",
+            base.custom_domain_verify_throttle.as_secs(),
+        )?);
         let store_raw_message = parse_env("STORE_RAW_MESSAGE", base.store_raw_message)?;
+
+        // Entitlements (docs/10). Defaults keep the self-host deployment fully
+        // open; the hosted instance opts in via env.
+        let entitlements_enforced = parse_env("ENTITLEMENTS_ENFORCED", base.entitlements_enforced)?;
+        let token_signing_key = match non_empty_env("TOKEN_SIGNING_KEY") {
+            Some(b64) => {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(b64.as_bytes())
+                    .context("TOKEN_SIGNING_KEY is not valid base64")?;
+                if bytes.len() < 32 {
+                    bail!(
+                        "TOKEN_SIGNING_KEY must decode to at least 32 bytes (got {})",
+                        bytes.len()
+                    );
+                }
+                Some(bytes)
+            }
+            None => None,
+        };
+        let revenuecat_secret_key = non_empty_env("REVENUECAT_SECRET_KEY");
+        let revenuecat_entitlement_id =
+            non_empty_env("REVENUECAT_ENTITLEMENT_ID").unwrap_or(base.revenuecat_entitlement_id);
+        if entitlements_enforced && token_signing_key.is_none() {
+            bail!("ENTITLEMENTS_ENFORCED=true requires TOKEN_SIGNING_KEY (base64, >=32 bytes)");
+        }
+        if revenuecat_secret_key.is_some() && token_signing_key.is_none() {
+            bail!("REVENUECAT_SECRET_KEY requires TOKEN_SIGNING_KEY to mint client tokens");
+        }
+
+        // App Attest (docs/09). Same all-or-none convention as APNS_*/VAPID_*.
+        let client_attestation_required = parse_env(
+            "CLIENT_ATTESTATION_REQUIRED",
+            base.client_attestation_required,
+        )?;
+        let app_attest_team_id = non_empty_env("APP_ATTEST_TEAM_ID");
+        let app_attest_bundle_id = non_empty_env("APP_ATTEST_BUNDLE_ID");
+        if app_attest_team_id.is_some() != app_attest_bundle_id.is_some() {
+            bail!("APP_ATTEST_TEAM_ID and APP_ATTEST_BUNDLE_ID must both be set, or both be unset");
+        }
+        if app_attest_team_id.is_some() && token_signing_key.is_none() {
+            bail!("APP_ATTEST_* requires TOKEN_SIGNING_KEY to mint client tokens");
+        }
+        if client_attestation_required && app_attest_team_id.is_none() {
+            bail!(
+                "CLIENT_ATTESTATION_REQUIRED=true requires APP_ATTEST_TEAM_ID and \
+                 APP_ATTEST_BUNDLE_ID (and TOKEN_SIGNING_KEY)"
+            );
+        }
+        let app_attest_root_pem = match non_empty_env("APP_ATTEST_ROOT_CA_PATH") {
+            Some(path) => Some(
+                std::fs::read(&path)
+                    .with_context(|| format!("reading APP_ATTEST_ROOT_CA_PATH ({path})"))?,
+            ),
+            None => None,
+        };
+        let free_tier = TierPolicy {
+            active_mailboxes: parse_env("FREE_ACTIVE_MAILBOXES", base.free_tier.active_mailboxes)?,
+            max_lifetime_seconds: parse_env(
+                "FREE_MAX_LIFETIME_SECONDS",
+                base.free_tier.max_lifetime_seconds,
+            )?,
+            custom_local_parts: parse_env(
+                "FREE_CUSTOM_LOCAL_PARTS",
+                base.free_tier.custom_local_parts,
+            )?,
+            domain_count: parse_env("FREE_DOMAIN_COUNT", base.free_tier.domain_count)?,
+            custom_domains: parse_env("FREE_CUSTOM_DOMAINS", base.free_tier.custom_domains)?,
+        };
+        let pro_tier = TierPolicy {
+            active_mailboxes: parse_env("PRO_ACTIVE_MAILBOXES", base.pro_tier.active_mailboxes)?,
+            max_lifetime_seconds: parse_env(
+                "PRO_MAX_LIFETIME_SECONDS",
+                base.pro_tier.max_lifetime_seconds,
+            )?,
+            ..base.pro_tier
+        };
 
         Ok(Self {
             smtp_bind_addr,
@@ -416,7 +587,20 @@ impl Config {
             apns_topic,
             apns_sandbox,
             catch_all_enabled,
+            custom_domains_enabled,
+            max_custom_domains_per_ip_per_day,
+            custom_domain_verify_throttle,
             store_raw_message,
+            entitlements_enforced,
+            token_signing_key,
+            revenuecat_secret_key,
+            revenuecat_entitlement_id,
+            client_attestation_required,
+            app_attest_team_id,
+            app_attest_bundle_id,
+            app_attest_root_pem,
+            free_tier,
+            pro_tier,
         })
     }
 
@@ -437,6 +621,37 @@ impl Config {
     /// True when at least one push channel is enabled.
     pub fn any_push_configured(&self) -> bool {
         self.push_configured() || self.apns_configured()
+    }
+
+    /// True when the server can mint client tokens — the availability switch
+    /// for `POST /api/entitlements/verify` (503 otherwise, like the push
+    /// routes).
+    pub fn entitlements_supported(&self) -> bool {
+        self.token_signing_key.is_some()
+    }
+
+    /// True when App Attest verification is configured (docs/09) — the
+    /// availability switch for the `POST /api/client/*` routes. Boot
+    /// validation guarantees a signing key exists alongside.
+    pub fn app_attest_configured(&self) -> bool {
+        self.app_attest_team_id.is_some() && self.app_attest_bundle_id.is_some()
+    }
+
+    /// The App Attest app identifier (`TEAMID.bundle.id`) attestations must
+    /// bind to, when configured.
+    pub fn app_attest_app_id(&self) -> Option<String> {
+        match (&self.app_attest_team_id, &self.app_attest_bundle_id) {
+            (Some(team), Some(bundle)) => Some(format!("{team}.{bundle}")),
+            _ => None,
+        }
+    }
+
+    /// The policy for one tier (docs/10).
+    pub fn tier_policy(&self, tier: crate::entitlements::Tier) -> &TierPolicy {
+        match tier {
+            crate::entitlements::Tier::Free => &self.free_tier,
+            crate::entitlements::Tier::Pro => &self.pro_tier,
+        }
     }
 
     /// Selects the storage backend from the `DATABASE_URL` scheme. Anything

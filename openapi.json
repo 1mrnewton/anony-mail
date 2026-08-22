@@ -4,7 +4,7 @@
     "title": "anony-mail API",
     "version": "0.3.0",
     "summary": "REST + Server-Sent Events API for an inbound-only disposable email backend.",
-    "description": "anony-mail is an inbound-only disposable email (temp mail) backend. It receives mail over SMTP for throwaway addresses and exposes it through this HTTP API. It does **not** send mail.\n\n### Conventions\n- **Base path:** every resource endpoint lives under `/api`; the health check is at `/healthz`.\n- **Content type:** request and response bodies are JSON, except attachment downloads (raw bytes) and the events endpoint (an SSE stream).\n- **Addresses are case-insensitive.** They are lowercased server-side before lookup or creation, so `Foo@Example.com` and `foo@example.com` refer to the same mailbox.\n- **Timestamps** are UTC in RFC 3339 / ISO 8601 format (e.g. `2026-07-01T11:23:45.123456Z`).\n- **IDs** (message and attachment) are UUIDs (v4).\n\n### Errors\nOn failure the API returns the matching HTTP status code with a JSON body of the form `{ \"error\": \"message\" }`. A `500` always reports a generic `\"internal server error\"` message; details are logged server-side.\n\n### Authentication (owner tokens)\nReads are open by design (temp mail is semi-public): anyone who knows an address can fetch the mailbox, its messages, attachments, and the SSE stream. **Destructive and lifecycle operations are gated by an owner token**: creating an address returns a one-time `owner_token` (`am_` + 43 base64url chars). Send it as `Authorization: Bearer <owner_token>` for extend, rotate, mailbox delete, and message delete; requests without a valid token fail with `401` and a `WWW-Authenticate: Bearer` header. The token is never returned again — store it client-side. Losing it means losing control of the mailbox (it stays readable until it expires). `POST /api/addresses/{address}/rotate` reissues the token and instantly revokes the old one.\n\n### Rate limiting\nRequests are rate limited per client IP (general bucket plus a stricter one on address creation, and a daily per-IP address-creation quota). Exceeding a limit returns `429 Too Many Requests`.\n\n### Mailbox lifecycle\nMailboxes expire after `DEFAULT_TTL_SECONDS` (default 1 hour) and are periodically purged along with their messages and attachments. Use `POST /api/addresses/{address}/extend` to push the expiry back.",
+    "description": "anony-mail is an inbound-only disposable email (temp mail) backend. It receives mail over SMTP for throwaway addresses and exposes it through this HTTP API. It does **not** send mail.\n\n### Conventions\n- **Base path:** every resource endpoint lives under `/api`; the health check is at `/healthz`.\n- **Content type:** request and response bodies are JSON, except attachment downloads (raw bytes) and the events endpoint (an SSE stream).\n- **Addresses are case-insensitive.** They are lowercased server-side before lookup or creation, so `Foo@Example.com` and `foo@example.com` refer to the same mailbox.\n- **Timestamps** are UTC in RFC 3339 / ISO 8601 format (e.g. `2026-07-01T11:23:45.123456Z`).\n- **IDs** (message and attachment) are UUIDs (v4).\n\n### Errors\nOn failure the API returns the matching HTTP status code with a JSON body of the form `{ \"error\": \"message\" }`. A `500` always reports a generic `\"internal server error\"` message; details are logged server-side.\n\n### Authentication (owner tokens)\nReads are open by design (temp mail is semi-public): anyone who knows an address can fetch the mailbox, its messages, attachments, and the SSE stream. **Destructive and lifecycle operations are gated by an owner token**: creating an address returns a one-time `owner_token` (`am_` + 43 base64url chars). Send it as `Authorization: Bearer <owner_token>` for extend, rotate, mailbox delete, and message delete; requests without a valid token fail with `401` and a `WWW-Authenticate: Bearer` header. The token is never returned again — store it client-side. Losing it means losing control of the mailbox (it stays readable until it expires). `POST /api/addresses/{address}/rotate` reissues the token and instantly revokes the old one.\n\n### Tiers & client tokens (hosted instances)\nServers with `ENTITLEMENTS_ENFORCED=true` gate some write features per tier (see `GET /api/capabilities` → `entitlements`). Clients prove their tier by calling `POST /api/entitlements/verify` (optionally with their anonymous RevenueCat app-user id) and sending the returned signed token as `X-Client-Token` on writes. **No token simply means free tier** — it is never an error by itself. Policy rejections use the matching status code plus a machine-readable `code` field: `pro_required`, `lifetime_cap`, `mailbox_cap` (403), `client_token_expired`, `client_token_invalid`, `attestation_required` (401). Self-hosted servers default to enforcement off: every feature is available with no token.\n\n### Client attestation (hosted instances)\nServers can additionally require proof that writes come from a genuine app build (`GET /api/capabilities` → `attestation`). iOS clients run Apple App Attest once per install (`POST /api/client/challenge` then `POST /api/client/attest`) and afterwards refresh their token with assertions (`POST /api/client/assert`); the resulting `X-Client-Token` carries the tier *and* marks the client as attested. When `attestation.required` is `true`, every mutating endpoint rejects requests without an attested token with `401` / `code: attestation_required` — reads stay open. Self-hosted servers leave this off entirely.\n\n### Rate limiting\nRequests are rate limited per client IP (general bucket plus a stricter one on address creation, and a daily per-IP address-creation quota). Exceeding a limit returns `429 Too Many Requests`.\n\n### Mailbox lifecycle\nMailboxes expire after `DEFAULT_TTL_SECONDS` (default 1 hour) and are periodically purged along with their messages and attachments. Use `POST /api/addresses/{address}/extend` to push the expiry back.",
     "license": {
       "name": "MIT OR Apache-2.0",
       "identifier": "MIT OR Apache-2.0"
@@ -40,8 +40,24 @@
       "description": "Liveness/readiness probe."
     },
     {
+      "name": "Capabilities",
+      "description": "Discover which optional server features this instance has enabled."
+    },
+    {
+      "name": "Entitlements",
+      "description": "Free/pro tier verification (`ENTITLEMENTS_ENFORCED`). Purchase-based, no accounts: the app exchanges its anonymous RevenueCat app-user id for a short-lived signed client token whose tier the write endpoints enforce. Self-hosted servers leave all of this off."
+    },
+    {
+      "name": "Client attestation",
+      "description": "Apple App Attest device verification (`APP_ATTEST_*`): challenge issuance, one-time key attestation, and assertion-based token refresh. Produces *attested* `X-Client-Token`s — the only kind accepted for writes when the server sets `CLIENT_ATTESTATION_REQUIRED=true`. Endpoints answer 503 when App Attest is not configured; self-hosted servers can ignore this feature entirely."
+    },
+    {
       "name": "Domains",
       "description": "Discover which domains this server accepts mail for."
+    },
+    {
+      "name": "Custom domains",
+      "description": "Bring your own domain: claim it, prove control via DNS (TXT + MX), then create mailboxes on it and receive mail. Endpoints answer 404 on servers with `CUSTOM_DOMAINS_ENABLED=false` — check `GET /api/capabilities` first. All routes except create require the domain's `amd_…` claim token, returned once by the create call."
     },
     {
       "name": "Mailboxes",
@@ -66,14 +82,20 @@
         "operationId": "healthCheck",
         "summary": "Health check (liveness)",
         "description": "Simple liveness probe. Always returns `200` with `{ \"status\": \"ok\" }` when the HTTP server is up. Never touches the database — use `/readyz` for readiness.",
-        "tags": ["Health"],
+        "tags": [
+          "Health"
+        ],
         "responses": {
           "200": {
             "description": "The service is up.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/HealthResponse" },
-                "example": { "status": "ok" }
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                },
+                "example": {
+                  "status": "ok"
+                }
               }
             }
           }
@@ -85,14 +107,20 @@
         "operationId": "readinessCheck",
         "summary": "Readiness check",
         "description": "Readiness probe: verifies the storage backend answers a trivial query (`SELECT 1` on SQL backends). Returns `200` with `{ \"status\": \"ready\" }` when the service can do useful work, `503` when the database is unreachable — point load-balancer/orchestrator readiness probes here.",
-        "tags": ["Health"],
+        "tags": [
+          "Health"
+        ],
         "responses": {
           "200": {
             "description": "The service is ready to serve traffic.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/ReadyResponse" },
-                "example": { "status": "ready" }
+                "schema": {
+                  "$ref": "#/components/schemas/ReadyResponse"
+                },
+                "example": {
+                  "status": "ready"
+                }
               }
             }
           },
@@ -100,8 +128,60 @@
             "description": "The storage backend is unreachable.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Error" },
-                "example": { "error": "store unavailable" }
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "store unavailable"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/capabilities": {
+      "get": {
+        "operationId": "getCapabilities",
+        "summary": "Discover enabled server features",
+        "description": "Reports which optional features this server instance has enabled — and the tier policy in force — so clients can adapt their UI without probing individual endpoints. Treat missing keys as `false` — new capabilities are added over time.\n\n- `apns_push` — native iOS push (APNs credentials configured).\n- `web_push` — Web Push (VAPID keypair configured).\n- `custom_domains` — bring-your-own-domain endpoints are live.\n- `attestation` — client-attestation posture: `supported` says the `/api/client/*` App Attest endpoints are live, `required` says every mutation demands an attested client token.\n- `entitlements` — whether free/pro limits are enforced, and what each tier may do. When `enforced` is `false`, unlock everything.",
+        "tags": [
+          "Capabilities"
+        ],
+        "responses": {
+          "200": {
+            "description": "The feature flags for this instance.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilitiesResponse"
+                },
+                "example": {
+                  "apns_push": true,
+                  "web_push": false,
+                  "custom_domains": true,
+                  "attestation": {
+                    "supported": false,
+                    "required": false
+                  },
+                  "entitlements": {
+                    "enforced": false,
+                    "free": {
+                      "active_mailboxes": 5,
+                      "max_lifetime_seconds": 86400,
+                      "custom_local_parts": false,
+                      "domain_count": 1,
+                      "custom_domains": false
+                    },
+                    "pro": {
+                      "active_mailboxes": 50,
+                      "max_lifetime_seconds": 0,
+                      "custom_local_parts": true,
+                      "domain_count": 0,
+                      "custom_domains": true
+                    }
+                  }
+                }
               }
             }
           }
@@ -113,21 +193,34 @@
         "operationId": "listDomains",
         "summary": "List configured domains",
         "description": "Returns the domains this server accepts mail for (the `DOMAINS` setting). The first entry is the default used when creating an address without specifying a domain.",
-        "tags": ["Domains"],
+        "tags": [
+          "Domains"
+        ],
         "responses": {
           "200": {
             "description": "The list of accepted domains.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/DomainsResponse" },
+                "schema": {
+                  "$ref": "#/components/schemas/DomainsResponse"
+                },
                 "examples": {
                   "single": {
                     "summary": "One configured domain",
-                    "value": { "domains": ["example.com"] }
+                    "value": {
+                      "domains": [
+                        "example.com"
+                      ]
+                    }
                   },
                   "multiple": {
                     "summary": "Several configured domains",
-                    "value": { "domains": ["example.com", "mail.example.org"] }
+                    "value": {
+                      "domains": [
+                        "example.com",
+                        "mail.example.org"
+                      ]
+                    }
                   }
                 }
               }
@@ -140,14 +233,18 @@
       "post": {
         "operationId": "createAddress",
         "summary": "Create a disposable address",
-        "description": "Creates a new mailbox and returns it **together with its one-time `owner_token`** — store the token client-side; it is required for extend, rotate, and all delete operations and is never returned again. The request body is **optional**:\n\n- Omit the body entirely (or send `{}`) to get a random 10-character local part on the first configured domain.\n- Provide `domain` to choose among the configured domains.\n- Provide `local_part` to request a custom address. It must be 1–64 characters of `[a-z0-9._-]` and must not start or end with a separator (`.`, `_`, `-`). If the address is already taken, the request fails with `409 Conflict`.\n\nReserved role/validation local parts (`admin`, `postmaster`, `webmaster`, `abuse`, `ssladmin`, ... — RFC 2142 plus the CA/Browser-Forum set, extensible server-side via `RESERVED_LOCAL_PARTS`) cannot be claimed and fail with `400 Bad Request`.\n\nCreation is rate limited per IP (including a daily quota); exceeding it fails with `429 Too Many Requests`.\n\nThe new mailbox expires after the server's default TTL (`DEFAULT_TTL_SECONDS`, 1 hour by default).",
-        "tags": ["Mailboxes"],
+        "description": "Creates a new mailbox and returns it **together with its one-time `owner_token`** — store the token client-side; it is required for extend, rotate, and all delete operations and is never returned again. The request body is **optional**:\n\n- Omit the body entirely (or send `{}`) to get a random 10-character local part on the first configured domain.\n- Provide `domain` to choose among the configured domains.\n- Provide `local_part` to request a custom address. It must be 1–64 characters of `[a-z0-9._-]` and must not start or end with a separator (`.`, `_`, `-`). If the address is already taken, the request fails with `409 Conflict`.\n\nReserved role/validation local parts (`admin`, `postmaster`, `webmaster`, `abuse`, `ssladmin`, ... — RFC 2142 plus the CA/Browser-Forum set, extensible server-side via `RESERVED_LOCAL_PARTS`) cannot be claimed and fail with `400 Bad Request`.\n\nCreation is rate limited per IP (including a daily quota); exceeding it fails with `429 Too Many Requests`.\n\nOn servers with custom domains enabled, `domain` may also be a **verified custom domain** — send its `amd_…` claim token as `Authorization: Bearer` (missing/wrong token fails with `401`, an unverified domain with `400`).\n\nThe new mailbox expires after the server's default TTL (`DEFAULT_TTL_SECONDS`, 1 hour by default).\n\nOn servers with `ENTITLEMENTS_ENFORCED=true`, tier policy applies: custom local parts, domains beyond the free `domain_count`, and custom domains may require pro. Send the client token from `POST /api/entitlements/verify` as `X-Client-Token`; without one the request is treated as free tier.\n\nWhen the token is **attested** (App Attest, `POST /api/client/attest`), the tier's `active_mailboxes` cap is enforced per device: once the device holds that many live mailboxes, creation fails with `403` / `code: mailbox_cap` until one expires or is deleted.",
+        "tags": [
+          "Mailboxes"
+        ],
         "requestBody": {
           "required": false,
           "description": "Optional address creation options.",
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/CreateAddressRequest" },
+              "schema": {
+                "$ref": "#/components/schemas/CreateAddressRequest"
+              },
               "examples": {
                 "random": {
                   "summary": "Random address on the default domain (empty body)",
@@ -155,11 +252,16 @@
                 },
                 "domainOnly": {
                   "summary": "Random local part on a chosen domain",
-                  "value": { "domain": "example.com" }
+                  "value": {
+                    "domain": "example.com"
+                  }
                 },
                 "custom": {
                   "summary": "Custom local part on a chosen domain",
-                  "value": { "local_part": "jane.doe", "domain": "example.com" }
+                  "value": {
+                    "local_part": "jane.doe",
+                    "domain": "example.com"
+                  }
                 }
               }
             }
@@ -170,7 +272,9 @@
             "description": "Mailbox created. The `owner_token` appears **only** in this response (and in a rotate response); it cannot be recovered later.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/CreateAddressResponse" },
+                "schema": {
+                  "$ref": "#/components/schemas/CreateAddressResponse"
+                },
                 "examples": {
                   "random": {
                     "summary": "Randomly generated address",
@@ -199,12 +303,54 @@
           "400": {
             "$ref": "#/components/responses/BadRequest"
           },
+          "401": {
+            "description": "The requested domain is a custom domain and the claim token is missing or wrong — or the supplied `X-Client-Token` is expired/invalid (`code` says which; refresh it via `POST /api/entitlements/verify`).",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "The expected authentication scheme.",
+                "schema": {
+                  "type": "string",
+                  "examples": [
+                    "Bearer"
+                  ]
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "custom domains require their claim token"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Rejected by tier policy (`ENTITLEMENTS_ENFORCED`). The `code` field says which gate: `pro_required` for custom local parts, extra domains, or custom domains on an insufficient tier; `mailbox_cap` when the attested device already holds the tier's maximum number of active mailboxes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "custom local parts require a higher tier",
+                  "code": "pro_required"
+                }
+              }
+            }
+          },
           "409": {
             "description": "The requested custom address already exists.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Error" },
-                "example": { "error": "address already exists: jane.doe@example.com" }
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "address already exists: jane.doe@example.com"
+                }
               }
             }
           },
@@ -219,19 +365,25 @@
     },
     "/api/addresses/{address}": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        }
       ],
       "get": {
         "operationId": "getMailbox",
         "summary": "Get mailbox info / check existence",
         "description": "Returns the mailbox's metadata if it exists. Note that an expired-but-not-yet-purged mailbox is still returned here; compare `expires_at` against the current time to determine whether it is still active.",
-        "tags": ["Mailboxes"],
+        "tags": [
+          "Mailboxes"
+        ],
         "responses": {
           "200": {
             "description": "The mailbox exists.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Mailbox" },
+                "schema": {
+                  "$ref": "#/components/schemas/Mailbox"
+                },
                 "example": {
                   "address": "a1b2c3d4e5@example.com",
                   "domain": "example.com",
@@ -253,8 +405,14 @@
         "operationId": "deleteMailbox",
         "summary": "Delete a mailbox",
         "description": "Deletes the mailbox and all of its messages and attachments (cascading). Requires the owner token. Returns `204 No Content` on success.",
-        "tags": ["Mailboxes"],
-        "security": [{ "ownerToken": [] }],
+        "tags": [
+          "Mailboxes"
+        ],
+        "security": [
+          {
+            "ownerToken": []
+          }
+        ],
         "responses": {
           "204": {
             "description": "Mailbox deleted."
@@ -273,20 +431,30 @@
     },
     "/api/addresses/{address}/extend": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        }
       ],
       "post": {
         "operationId": "extendMailbox",
         "summary": "Extend a mailbox's expiry",
-        "description": "Pushes the mailbox's `expires_at` to now + the server default TTL (`DEFAULT_TTL_SECONDS`). The extension is relative to the current time, not to the previous expiry. Requires the owner token (which stays the same — extending never rotates it). No request body is required.",
-        "tags": ["Mailboxes"],
-        "security": [{ "ownerToken": [] }],
+        "description": "Pushes the mailbox's `expires_at` to now + the server default TTL (`DEFAULT_TTL_SECONDS`). The extension is relative to the current time, not to the previous expiry. Requires the owner token (which stays the same — extending never rotates it). No request body is required.\n\nOn servers with `ENTITLEMENTS_ENFORCED=true`, the mailbox's total lifetime (`expires_at - created_at`, extends included) is capped per tier (`max_lifetime_seconds` in `GET /api/capabilities`). Extending past the cap returns `403` with `code: lifetime_cap`; send a pro `X-Client-Token` for the higher ceiling.",
+        "tags": [
+          "Mailboxes"
+        ],
+        "security": [
+          {
+            "ownerToken": []
+          }
+        ],
         "responses": {
           "200": {
             "description": "Expiry extended; the updated mailbox is returned.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Mailbox" },
+                "schema": {
+                  "$ref": "#/components/schemas/Mailbox"
+                },
                 "example": {
                   "address": "a1b2c3d4e5@example.com",
                   "domain": "example.com",
@@ -299,6 +467,20 @@
           "401": {
             "$ref": "#/components/responses/Unauthorized"
           },
+          "403": {
+            "description": "Extending would exceed this tier's maximum mailbox lifetime (`code: lifetime_cap`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "extending would exceed this tier's max mailbox lifetime of 86400s",
+                  "code": "lifetime_cap"
+                }
+              }
+            }
+          },
           "404": {
             "$ref": "#/components/responses/MailboxNotFound"
           },
@@ -310,21 +492,33 @@
     },
     "/api/addresses/{address}/rotate": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        }
       ],
       "post": {
         "operationId": "rotateOwnerToken",
         "summary": "Rotate the owner token",
         "description": "Reissues the mailbox's owner token and returns the new one; the previous token is revoked **immediately**. Use this if the token may have leaked. Requires the current owner token. No request body is required.",
-        "tags": ["Mailboxes"],
-        "security": [{ "ownerToken": [] }],
+        "tags": [
+          "Mailboxes"
+        ],
+        "security": [
+          {
+            "ownerToken": []
+          }
+        ],
         "responses": {
           "200": {
             "description": "Token rotated. This response is the only place the new token appears.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/RotateTokenResponse" },
-                "example": { "owner_token": "am_Zx8cV2bN4mA6sD1fG3hJ5kL7qW9eR0tY_uIoPaSdFgs" }
+                "schema": {
+                  "$ref": "#/components/schemas/RotateTokenResponse"
+                },
+                "example": {
+                  "owner_token": "am_Zx8cV2bN4mA6sD1fG3hJ5kL7qW9eR0tY_uIoPaSdFgs"
+                }
               }
             }
           },
@@ -342,13 +536,17 @@
     },
     "/api/addresses/{address}/messages": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        }
       ],
       "get": {
         "operationId": "listMessages",
         "summary": "List messages in a mailbox",
         "description": "Returns lightweight summaries of the mailbox's messages, newest first (ordered by `received_at` then `id`, both descending). Bodies and attachment metadata are omitted here — fetch a single message for the full content. An existing mailbox with no mail returns `200` with an empty array `[]`; a missing mailbox returns `404`.\n\nPagination: `limit` caps the page size (default 50, max 200). `since` is a keyset cursor — pass the id of the newest message you have seen and only strictly newer messages are returned, which is the cheap way to poll for deltas (e.g. after a push notification). If the `since` message no longer exists (expired, deleted, or dropped by quota), the cursor is ignored and the newest page is returned.",
-        "tags": ["Messages"],
+        "tags": [
+          "Messages"
+        ],
         "parameters": [
           {
             "name": "limit",
@@ -367,7 +565,10 @@
             "in": "query",
             "required": false,
             "description": "Keyset cursor: return only messages strictly newer than this message id.",
-            "schema": { "type": "string", "format": "uuid" }
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
@@ -377,7 +578,9 @@
               "application/json": {
                 "schema": {
                   "type": "array",
-                  "items": { "$ref": "#/components/schemas/MessageSummary" }
+                  "items": {
+                    "$ref": "#/components/schemas/MessageSummary"
+                  }
                 },
                 "examples": {
                   "withMail": {
@@ -421,15 +624,25 @@
         "operationId": "clearInbox",
         "summary": "Delete all messages in a mailbox",
         "description": "Deletes every message (and their attachments) in the mailbox in one call. The mailbox itself, its expiry, and its owner token are untouched. Requires the owner token.",
-        "tags": ["Messages"],
-        "security": [{ "ownerToken": [] }],
+        "tags": [
+          "Messages"
+        ],
+        "security": [
+          {
+            "ownerToken": []
+          }
+        ],
         "responses": {
           "200": {
             "description": "Inbox cleared.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/ClearInboxResponse" },
-                "example": { "deleted": 4 }
+                "schema": {
+                  "$ref": "#/components/schemas/ClearInboxResponse"
+                },
+                "example": {
+                  "deleted": 4
+                }
               }
             }
           },
@@ -447,20 +660,28 @@
     },
     "/api/addresses/{address}/messages/{id}": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" },
-        { "$ref": "#/components/parameters/MessageIdPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        },
+        {
+          "$ref": "#/components/parameters/MessageIdPath"
+        }
       ],
       "get": {
         "operationId": "getMessage",
         "summary": "Get a full message",
         "description": "Returns a single message including its text and/or HTML bodies and attachment metadata. Attachment bytes are not inlined — download them individually via the attachments endpoint using each attachment's `id`.\n\nSecurity note: `html_body` is untrusted, attacker-controlled markup (anyone can email the inbox). Render it only in a sandboxed iframe or after sanitization — see the schema description.",
-        "tags": ["Messages"],
+        "tags": [
+          "Messages"
+        ],
         "responses": {
           "200": {
             "description": "The full message.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/StoredMessage" },
+                "schema": {
+                  "$ref": "#/components/schemas/StoredMessage"
+                },
                 "examples": {
                   "withAttachment": {
                     "summary": "Message with one PDF attachment",
@@ -517,8 +738,14 @@
         "operationId": "deleteMessage",
         "summary": "Delete a single message",
         "description": "Deletes one message (and its attachments) from the mailbox. Requires the owner token. Returns `204 No Content` on success.",
-        "tags": ["Messages"],
-        "security": [{ "ownerToken": [] }],
+        "tags": [
+          "Messages"
+        ],
+        "security": [
+          {
+            "ownerToken": []
+          }
+        ],
         "responses": {
           "204": {
             "description": "Message deleted."
@@ -537,14 +764,20 @@
     },
     "/api/addresses/{address}/messages/{id}/read": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" },
-        { "$ref": "#/components/parameters/MessageIdPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        },
+        {
+          "$ref": "#/components/parameters/MessageIdPath"
+        }
       ],
       "post": {
         "operationId": "markMessageRead",
         "summary": "Mark a message as read",
         "description": "Sets the message's `seen` flag. Idempotent — marking an already-read message succeeds. Open like the read endpoints (knowing the address already grants read access), so no owner token is required.",
-        "tags": ["Messages"],
+        "tags": [
+          "Messages"
+        ],
         "responses": {
           "204": {
             "description": "Message marked read."
@@ -560,26 +793,39 @@
     },
     "/api/addresses/{address}/messages/{id}/raw": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" },
-        { "$ref": "#/components/parameters/MessageIdPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        },
+        {
+          "$ref": "#/components/parameters/MessageIdPath"
+        }
       ],
       "get": {
         "operationId": "getRawMessage",
         "summary": "Download the original message (.eml)",
         "description": "Returns the message's original RFC 5322 bytes as received over SMTP (dot-unstuffed), served as `message/rfc822` with an attachment disposition (`{id}.eml`) and `X-Content-Type-Options: nosniff`. Only available when the server runs with `STORE_RAW_MESSAGE=true`; otherwise — and for messages delivered before the toggle was enabled — this endpoint returns `404`.",
-        "tags": ["Messages"],
+        "tags": [
+          "Messages"
+        ],
         "responses": {
           "200": {
             "description": "The original message bytes.",
             "headers": {
               "Content-Disposition": {
                 "description": "Attachment disposition named after the message id.",
-                "schema": { "type": "string" },
+                "schema": {
+                  "type": "string"
+                },
                 "example": "attachment; filename=\"550e8400-e29b-41d4-a716-446655440000.eml\""
               },
               "X-Content-Type-Options": {
                 "description": "Always `nosniff`.",
-                "schema": { "type": "string", "enum": ["nosniff"] }
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "nosniff"
+                  ]
+                }
               }
             },
             "content": {
@@ -596,7 +842,9 @@
             "description": "Message not found, or raw retention is disabled.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Error" },
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
                 "example": {
                   "error": "raw message not available (missing, or raw retention is disabled)"
                 }
@@ -611,31 +859,48 @@
     },
     "/api/addresses/{address}/messages/{id}/attachments/{attachment_id}": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" },
-        { "$ref": "#/components/parameters/MessageIdPath" },
-        { "$ref": "#/components/parameters/AttachmentIdPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        },
+        {
+          "$ref": "#/components/parameters/MessageIdPath"
+        },
+        {
+          "$ref": "#/components/parameters/AttachmentIdPath"
+        }
       ],
       "get": {
         "operationId": "getAttachment",
         "summary": "Download an attachment",
         "description": "Streams the raw bytes of an attachment. The response's `Content-Type` is the attachment's stored MIME type, except that browser-active types (`text/html`, `application/xhtml+xml`, `image/svg+xml`, `text/xml`, `application/xml`) are served as `application/octet-stream` so a crafted attachment cannot execute on the API origin — the real type remains available in the message's attachment metadata. Every response carries `X-Content-Type-Options: nosniff`. `Content-Disposition` is set to `attachment` with a sanitized ASCII filename, plus an RFC 5987 `filename*=UTF-8''…` form when the original name is non-ASCII.",
-        "tags": ["Messages"],
+        "tags": [
+          "Messages"
+        ],
         "responses": {
           "200": {
             "description": "Raw attachment bytes.",
             "headers": {
               "Content-Type": {
                 "description": "The attachment's stored MIME type, e.g. `application/pdf`. Browser-active types are replaced with `application/octet-stream`.",
-                "schema": { "type": "string" }
+                "schema": {
+                  "type": "string"
+                }
               },
               "Content-Disposition": {
                 "description": "Download disposition with a sanitized ASCII filename, plus an RFC 5987 `filename*` form for non-ASCII names.",
-                "schema": { "type": "string" },
+                "schema": {
+                  "type": "string"
+                },
                 "example": "attachment; filename=\"invoice-1042.pdf\""
               },
               "X-Content-Type-Options": {
                 "description": "Always `nosniff`: forbids MIME sniffing of the download.",
-                "schema": { "type": "string", "enum": ["nosniff"] }
+                "schema": {
+                  "type": "string",
+                  "enum": [
+                    "nosniff"
+                  ]
+                }
               }
             },
             "content": {
@@ -652,8 +917,12 @@
             "description": "The attachment (or its message/mailbox) was not found.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Error" },
-                "example": { "error": "attachment not found" }
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "attachment not found"
+                }
               }
             }
           },
@@ -668,14 +937,21 @@
         "operationId": "getPushConfig",
         "summary": "Which push channels are enabled",
         "description": "Reports which push channels this server can deliver on: `webpush` (browsers/PWAs via VAPID) and `apns` (native iOS apps). Use it to decide whether to prompt the user for notification permission at all.",
-        "tags": ["Push"],
+        "tags": [
+          "Push"
+        ],
         "responses": {
           "200": {
             "description": "Channel availability.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/PushConfigResponse" },
-                "example": { "webpush": true, "apns": true }
+                "schema": {
+                  "$ref": "#/components/schemas/PushConfigResponse"
+                },
+                "example": {
+                  "webpush": true,
+                  "apns": true
+                }
               }
             }
           }
@@ -687,14 +963,20 @@
         "operationId": "getVapidPublicKey",
         "summary": "Get the VAPID public key",
         "description": "Returns the server's VAPID public key. Pass it (decoded from base64url) as `applicationServerKey` to `PushManager.subscribe` in the browser.",
-        "tags": ["Push"],
+        "tags": [
+          "Push"
+        ],
         "responses": {
           "200": {
             "description": "The configured VAPID public key.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/VapidPublicKeyResponse" },
-                "example": { "vapid_public_key": "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM" }
+                "schema": {
+                  "$ref": "#/components/schemas/VapidPublicKeyResponse"
+                },
+                "example": {
+                  "vapid_public_key": "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM"
+                }
               }
             }
           },
@@ -706,20 +988,30 @@
     },
     "/api/addresses/{address}/subscriptions": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        }
       ],
       "post": {
         "operationId": "subscribePush",
         "summary": "Register a push subscription (Web Push or APNs)",
         "description": "Registers a push subscription for this mailbox so new-mail notifications reach the device. Requires the owner token. Two shapes share this endpoint:\n\n- **Web Push** (browser/PWA): send `PushSubscription.toJSON()`, i.e. `{ endpoint, keys: { p256dh, auth } }`.\n- **APNs** (native iOS app): send `{ device_token }` — the hex token from `didRegisterForRemoteNotificationsWithDeviceToken`.\n\nThe `kind` field is optional; it is inferred from which identifier is present. Subscribing to a channel the server has no credentials for answers `503` (check `GET /api/push/config` first). Idempotent per `(mailbox, endpoint/token)`: re-subscribing refreshes the record instead of creating a duplicate. The number of subscriptions per mailbox (all kinds combined) is capped server-side (`MAX_SUBSCRIPTIONS_PER_MAILBOX`, default 5).",
-        "tags": ["Push"],
-        "security": [{ "ownerToken": [] }],
+        "tags": [
+          "Push"
+        ],
+        "security": [
+          {
+            "ownerToken": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "description": "A Web Push subscription or an APNs device token.",
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/SubscribeRequest" },
+              "schema": {
+                "$ref": "#/components/schemas/SubscribeRequest"
+              },
               "examples": {
                 "webpush": {
                   "summary": "Browser / PWA (Web Push)",
@@ -746,8 +1038,13 @@
             "description": "Subscription registered (or refreshed).",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/SubscribeResponse" },
-                "example": { "id": "8f14e45f-ceea-467f-a34e-9b7f7c3d9d10", "kind": "apns" }
+                "schema": {
+                  "$ref": "#/components/schemas/SubscribeResponse"
+                },
+                "example": {
+                  "id": "8f14e45f-ceea-467f-a34e-9b7f7c3d9d10",
+                  "kind": "apns"
+                }
               }
             }
           },
@@ -772,21 +1069,33 @@
         "operationId": "unsubscribePush",
         "summary": "Remove a push subscription",
         "description": "Unregisters the subscription identified by its Web Push `endpoint` or APNs `device_token` (provide either). Requires the owner token. Works even when the server currently has no push credentials, so clients can always clean up.",
-        "tags": ["Push"],
-        "security": [{ "ownerToken": [] }],
+        "tags": [
+          "Push"
+        ],
+        "security": [
+          {
+            "ownerToken": []
+          }
+        ],
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/UnsubscribeRequest" },
+              "schema": {
+                "$ref": "#/components/schemas/UnsubscribeRequest"
+              },
               "examples": {
                 "webpush": {
                   "summary": "By Web Push endpoint",
-                  "value": { "endpoint": "https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..." }
+                  "value": {
+                    "endpoint": "https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..."
+                  }
                 },
                 "apns": {
                   "summary": "By APNs device token",
-                  "value": { "device_token": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2" }
+                  "value": {
+                    "device_token": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+                  }
                 }
               }
             }
@@ -803,23 +1112,291 @@
             "description": "The mailbox or subscription was not found.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Error" },
-                "example": { "error": "subscription not found" }
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "subscription not found"
+                }
               }
             }
           }
         }
       }
     },
+    "/api/custom-domains": {
+      "post": {
+        "operationId": "createCustomDomain",
+        "summary": "Claim a custom domain",
+        "description": "Claims a domain you own and returns the DNS records to publish plus the **one-time `claim_token`** (`amd_…`) — store it client-side; it gates every other operation on the domain (status, verify, delete, and creating mailboxes on it) and is never returned again.\n\nPublish both records, then call the verify endpoint:\n\n- **TXT** at `_anonymail.<domain>` with the returned `txt_record` value.\n- **MX** at `<domain>` pointing to the returned `mx_target` (any priority).\n\nThe server's own domains (and their subdomains) cannot be claimed and fail with `400 Bad Request`. Claims are strictly rate limited per IP, including a daily quota (`MAX_CUSTOM_DOMAINS_PER_IP_PER_DAY`); exceeding it fails with `429 Too Many Requests`.\n\nOn servers with `ENTITLEMENTS_ENFORCED=true`, claiming a domain requires a tier whose policy allows custom domains (pro by default) — send the client token as `X-Client-Token`, otherwise the request is treated as free tier and rejected with `403` / `code: pro_required`.",
+        "tags": [
+          "Custom domains"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateCustomDomainRequest"
+              },
+              "example": {
+                "domain": "mail.mycorp.com"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Domain claimed, status `pending`. The `claim_token` appears **only** in this response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomDomain"
+                },
+                "example": {
+                  "domain": "mail.mycorp.com",
+                  "status": "pending",
+                  "txt_record": "anonymail-verify=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
+                  "mx_target": "mx.example.com",
+                  "claim_token": "amd_hK3T9qmZ2xWfJ8dLpR5vY0cN1aQ6sB4eU7gIoPkXmVs"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "description": "The supplied `X-Client-Token` is expired or invalid (`code` says which; refresh it via `POST /api/entitlements/verify`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "client token expired, call POST /api/entitlements/verify again",
+                  "code": "client_token_expired"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "This tier may not claim custom domains (`code: pro_required`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "custom domains require a higher tier",
+                  "code": "pro_required"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is already claimed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "domain already claimed: mail.mycorp.com"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/custom-domains/{domain}": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DomainPath"
+        }
+      ],
+      "get": {
+        "operationId": "getCustomDomain",
+        "summary": "Get custom domain status",
+        "description": "Returns the claim's current status and the DNS records to publish. Requires the claim token.",
+        "tags": [
+          "Custom domains"
+        ],
+        "security": [
+          {
+            "claimToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The claim.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomDomain"
+                },
+                "example": {
+                  "domain": "mail.mycorp.com",
+                  "status": "verified",
+                  "txt_record": "anonymail-verify=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
+                  "mx_target": "mx.example.com",
+                  "verified_at": "2026-07-01T11:23:45.123456Z"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/DomainNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteCustomDomain",
+        "summary": "Release a custom domain",
+        "description": "Deletes the claim. Inbound mail and new mailbox creation on the domain stop immediately; existing mailboxes live out their TTL. Requires the claim token.",
+        "tags": [
+          "Custom domains"
+        ],
+        "security": [
+          {
+            "claimToken": []
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Claim released."
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/DomainNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/custom-domains/{domain}/verify": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/DomainPath"
+        }
+      ],
+      "post": {
+        "operationId": "verifyCustomDomain",
+        "summary": "Run DNS verification now",
+        "description": "Looks up the TXT and MX records live and persists the outcome, returning per-record results. When both checks pass the domain becomes `verified`: the server accepts mail for it and mailboxes can be created on it.\n\nVerified domains are re-checked daily in the background. A domain whose DNS stays broken for more than a ~48h grace window flips to `failed` (mail and creates stop); a later successful verify restores it.\n\nRuns are throttled per domain (roughly one every 10 seconds); calling faster answers `429`. Requires the claim token. No request body.",
+        "tags": [
+          "Custom domains"
+        ],
+        "security": [
+          {
+            "claimToken": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Checks ran; the returned `status` reflects the persisted outcome.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CustomDomain"
+                },
+                "examples": {
+                  "passed": {
+                    "summary": "Both records found — domain verified",
+                    "value": {
+                      "domain": "mail.mycorp.com",
+                      "status": "verified",
+                      "txt_record": "anonymail-verify=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
+                      "mx_target": "mx.example.com",
+                      "verified_at": "2026-07-01T11:23:45.123456Z",
+                      "checks": [
+                        {
+                          "record": "txt",
+                          "ok": true,
+                          "expected": "anonymail-verify=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
+                          "found": "anonymail-verify=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c"
+                        },
+                        {
+                          "record": "mx",
+                          "ok": true,
+                          "expected": "mx.example.com",
+                          "found": "mx.example.com"
+                        }
+                      ]
+                    }
+                  },
+                  "failed": {
+                    "summary": "MX record missing — still pending",
+                    "value": {
+                      "domain": "mail.mycorp.com",
+                      "status": "pending",
+                      "txt_record": "anonymail-verify=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
+                      "mx_target": "mx.example.com",
+                      "checks": [
+                        {
+                          "record": "txt",
+                          "ok": true,
+                          "expected": "anonymail-verify=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c",
+                          "found": "anonymail-verify=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c"
+                        },
+                        {
+                          "record": "mx",
+                          "ok": false,
+                          "expected": "mx.example.com",
+                          "found": null
+                        }
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/DomainNotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
     "/api/addresses/{address}/events": {
       "parameters": [
-        { "$ref": "#/components/parameters/AddressPath" }
+        {
+          "$ref": "#/components/parameters/AddressPath"
+        }
       ],
       "get": {
         "operationId": "streamEvents",
         "summary": "Stream new-message events (SSE)",
         "description": "Opens a [Server-Sent Events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events) stream that pushes one event named `message` each time mail arrives for this address. The event's `data` field is a JSON-encoded `MailEvent` (see the schema).\n\nThe stream sends periodic keep-alive comments to hold the connection open. It is a low-latency **nudge** only: events may be missed while disconnected and are not replayed, so on (re)connect always re-fetch `GET /api/addresses/{address}/messages` to reconcile.\n\nExample (browser):\n\n```js\nconst es = new EventSource(\n  `/api/addresses/${encodeURIComponent(address)}/events`\n);\nes.addEventListener(\"message\", (e) => {\n  const evt = JSON.parse(e.data); // MailEvent\n  // fetch the full message, or refresh the inbox listing\n});\n```\n\nNote: this endpoint does not validate that the mailbox exists; subscribing to an unknown or expired address simply yields a stream that never emits.",
-        "tags": ["Events"],
+        "tags": [
+          "Events"
+        ],
         "responses": {
           "200": {
             "description": "An open `text/event-stream`. Each `message` event carries a JSON `MailEvent` in its `data` field.",
@@ -836,6 +1413,246 @@
           }
         }
       }
+    },
+    "/api/entitlements/verify": {
+      "post": {
+        "operationId": "verifyEntitlements",
+        "summary": "Verify a purchase and mint a tier token",
+        "description": "Checks the pro entitlement for the given anonymous RevenueCat app-user id and returns a signed client token carrying the resulting tier (`free` or `pro`). Omit the id (or the whole body) for a free-tier token. Send the token as `X-Client-Token` on writes while it is valid, and call this endpoint again to refresh it — renewal re-checks the purchase, so lapsed subscriptions degrade to free within the token TTL.\n\nTokens from this endpoint are **unattested**: on servers where `GET /api/capabilities` reports `attestation.required: true` they do not satisfy the write gate — use `POST /api/client/attest` / `assert` instead, which run the same tier check and mint an attested token.\n\nAvailable whenever the server has a `TOKEN_SIGNING_KEY` (503 otherwise); `ENTITLEMENTS_ENFORCED` only controls whether write endpoints check the token. Shares the strict address-creation rate-limit budget.",
+        "tags": [
+          "Entitlements"
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyEntitlementsRequest"
+              },
+              "example": {
+                "rc_app_user_id": "$RCAnonymousID:87c6049c58069238dce29853f60e2c62"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Token minted. `tier` reflects the purchase check (`free` when no id was sent or the entitlement is inactive).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientTokenResponse"
+                },
+                "example": {
+                  "client_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJraW5kIjoidW5hdHRlc3RlZCIsInRpZXIiOiJwcm8iLCJpYXQiOjE3NTU4NDAwMDAsImV4cCI6MTc1NTg4MzIwMH0.signature",
+                  "tier": "pro",
+                  "expires_at": "2026-08-22T19:00:00Z"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "description": "Entitlements are not configured on this server (no `TOKEN_SIGNING_KEY`), or the upstream purchase check is temporarily unavailable — keep the current token and retry later.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "entitlements are not configured on this server"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/client/challenge": {
+      "post": {
+        "operationId": "clientChallenge",
+        "summary": "Issue an App Attest challenge",
+        "description": "Returns a single-use challenge for the attest/assert flows. Feed its SHA-256 (of the UTF-8 string) to `DCAppAttestService` as the `clientDataHash`, then send the same string back in the follow-up call. A challenge can be consumed exactly once and expires after `expires_in` seconds — request a fresh one per attempt.\n\nAvailable whenever App Attest is configured (`APP_ATTEST_TEAM_ID` + `APP_ATTEST_BUNDLE_ID` + `TOKEN_SIGNING_KEY`); 503 otherwise. Shares the strict address-creation rate-limit budget. No request body.",
+        "tags": [
+          "Client attestation"
+        ],
+        "responses": {
+          "200": {
+            "description": "A fresh challenge.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChallengeResponse"
+                },
+                "example": {
+                  "challenge": "vN3kx4nyBIRotmxTZ7qXW1ZQ8Kk5cLVX9y0mUuxbcpM",
+                  "expires_in": 300
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AttestationNotConfigured"
+          }
+        }
+      }
+    },
+    "/api/client/attest": {
+      "post": {
+        "operationId": "clientAttest",
+        "summary": "Attest a device key and mint an attested token",
+        "description": "One-time device registration. Verifies the App Attest attestation object locally (certificate chain to Apple's App Attest root CA, app id, challenge hash), stores the device's public key, and returns an **attested** client token — same shape as `POST /api/entitlements/verify`, but it also satisfies servers with `CLIENT_ATTESTATION_REQUIRED=true`. Include the anonymous RevenueCat app-user id so the token carries the right tier.\n\nRun once per app install with the result of `DCAppAttestService.generateKey` + `attestKey`; afterwards refresh tokens with `POST /api/client/assert`. Rejections are coded (`400`): `invalid_challenge` for an unknown, expired, or reused challenge, `invalid_attestation` when verification fails.",
+        "tags": [
+          "Client attestation"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttestRequest"
+              },
+              "example": {
+                "key_id": "Zju0hI0hL0iF2F6cx3QF6h0h4Y9V0kEEY0eXjxKq04c=",
+                "attestation": "o2NmbXRvYXBwbGUtYXBwYXR0ZXN0Z2F0dFN0bXSiY3g1Y4JZAz...",
+                "challenge": "vN3kx4nyBIRotmxTZ7qXW1ZQ8Kk5cLVX9y0mUuxbcpM",
+                "rc_app_user_id": "$RCAnonymousID:87c6049c58069238dce29853f60e2c62"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Device registered; attested token minted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientTokenResponse"
+                },
+                "example": {
+                  "client_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJraW5kIjoiaW9zIiwia2lkIjoiWmp1MGhJMGhMMGlGMkY2Y3gzUUY2aDBoNFk5VjBrRUVZMGVYanhLcTA0Yz0iLCJ0aWVyIjoicHJvIn0.signature",
+                  "tier": "pro",
+                  "expires_at": "2026-08-22T19:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The challenge or the attestation was rejected — `code` says which: `invalid_challenge` (request a new challenge and retry) or `invalid_attestation` (the attestation object failed verification).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "challenge unknown, expired, or already used; request a new one",
+                  "code": "invalid_challenge"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AttestationNotConfigured"
+          }
+        }
+      }
+    },
+    "/api/client/assert": {
+      "post": {
+        "operationId": "clientAssert",
+        "summary": "Refresh an attested token with an assertion",
+        "description": "Refreshes the attested client token by proving possession of a previously registered device key: call `DCAppAttestService.generateAssertion` over the SHA-256 of a fresh challenge and send the result. The assertion's signature counter must strictly increase, which blocks replay — on a counter conflict just retry with a fresh challenge.\n\nCall it whenever the current token nears `expires_at` (the tier is re-checked on every refresh). Coded rejections: `invalid_challenge` and `invalid_assertion` (`400`), plus `attestation_required` (`401`) when the key id is unknown — for example pruned after long inactivity — in which case run the attest flow again.",
+        "tags": [
+          "Client attestation"
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssertRequest"
+              },
+              "example": {
+                "key_id": "Zju0hI0hL0iF2F6cx3QF6h0h4Y9V0kEEY0eXjxKq04c=",
+                "assertion": "omlzaWduYXR1cmVYRzBFAiEA0YQx3Zt0iF2F6cx3QF6h0h4...",
+                "challenge": "kQ8mZ1JXW1ZQ8Kk5cLVX9y0mUuxbcpMvN3kx4nyBIRo",
+                "rc_app_user_id": "$RCAnonymousID:87c6049c58069238dce29853f60e2c62"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Assertion verified; fresh attested token minted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClientTokenResponse"
+                },
+                "example": {
+                  "client_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJraW5kIjoiaW9zIiwia2lkIjoiWmp1MGhJMGhMMGlGMkY2Y3gzUUY2aDBoNFk5VjBrRUVZMGVYanhLcTA0Yz0iLCJ0aWVyIjoicHJvIn0.signature",
+                  "tier": "pro",
+                  "expires_at": "2026-08-22T19:00:00Z"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The challenge or the assertion was rejected — `code` says which: `invalid_challenge` (request a new challenge and retry) or `invalid_assertion` (bad signature, wrong app id, or a non-increasing counter).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "assertion counter conflict, retry with a fresh challenge",
+                  "code": "invalid_assertion"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The key id is not registered on this server (never attested, or pruned after long inactivity). Run `POST /api/client/attest` again.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "unknown key id, attest this device first",
+                  "code": "attestation_required"
+                }
+              }
+            }
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          },
+          "503": {
+            "$ref": "#/components/responses/AttestationNotConfigured"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -844,6 +1661,17 @@
         "type": "http",
         "scheme": "bearer",
         "description": "Per-mailbox owner token returned once by `POST /api/addresses` (and by rotate). Format: `am_` + 43 base64url characters. Sent as `Authorization: Bearer <owner_token>`."
+      },
+      "claimToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Per-domain claim token returned once by `POST /api/custom-domains`. Format: `amd_` + 43 base64url characters. Sent as `Authorization: Bearer <claim_token>`."
+      },
+      "clientToken": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Client-Token",
+        "description": "Signed tier token (12h TTL) from `POST /api/entitlements/verify` (unattested) or `POST /api/client/attest` / `assert` (attested, App Attest). Optional: on enforcing servers a request without it is treated as free tier — unless the server reports `attestation.required`, in which case mutations demand an attested one. `Authorization` stays reserved for owner/claim tokens, so both can be sent together."
       }
     },
     "parameters": {
@@ -855,7 +1683,9 @@
         "schema": {
           "type": "string",
           "format": "email",
-          "examples": ["a1b2c3d4e5@example.com"]
+          "examples": [
+            "a1b2c3d4e5@example.com"
+          ]
         }
       },
       "MessageIdPath": {
@@ -866,7 +1696,9 @@
         "schema": {
           "type": "string",
           "format": "uuid",
-          "examples": ["550e8400-e29b-41d4-a716-446655440000"]
+          "examples": [
+            "550e8400-e29b-41d4-a716-446655440000"
+          ]
         }
       },
       "AttachmentIdPath": {
@@ -877,7 +1709,21 @@
         "schema": {
           "type": "string",
           "format": "uuid",
-          "examples": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]
+          "examples": [
+            "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+          ]
+        }
+      },
+      "DomainPath": {
+        "name": "domain",
+        "in": "path",
+        "required": true,
+        "description": "The claimed custom domain. Case-insensitive (lowercased server-side).",
+        "schema": {
+          "type": "string",
+          "examples": [
+            "mail.mycorp.com"
+          ]
         }
       }
     },
@@ -886,15 +1732,21 @@
         "description": "The request was invalid (e.g. unknown domain or malformed `local_part`).",
         "content": {
           "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" },
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
             "examples": {
               "unknownDomain": {
                 "summary": "Domain is not in the server's DOMAINS list",
-                "value": { "error": "unknown domain: nope.test" }
+                "value": {
+                  "error": "unknown domain: nope.test"
+                }
               },
               "invalidLocalPart": {
                 "summary": "local_part failed validation",
-                "value": { "error": "local_part must be 1-64 chars of a-z, 0-9, '.', '_' or '-' and not start/end with a separator" }
+                "value": {
+                  "error": "local_part must be 1-64 chars of a-z, 0-9, '.', '_' or '-' and not start/end with a separator"
+                }
               }
             }
           }
@@ -905,21 +1757,29 @@
         "headers": {
           "WWW-Authenticate": {
             "description": "The expected authentication scheme.",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "example": "Bearer"
           }
         },
         "content": {
           "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" },
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
             "examples": {
               "missing": {
                 "summary": "No Authorization header",
-                "value": { "error": "missing bearer token" }
+                "value": {
+                  "error": "missing bearer token"
+                }
               },
               "invalid": {
                 "summary": "Wrong or rotated-away token",
-                "value": { "error": "invalid owner token" }
+                "value": {
+                  "error": "invalid owner token"
+                }
               }
             }
           }
@@ -929,8 +1789,25 @@
         "description": "A per-IP rate limit or quota was exceeded. Retry later.",
         "content": {
           "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" },
-            "example": { "error": "daily address creation limit reached" }
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "daily address creation limit reached"
+            }
+          }
+        }
+      },
+      "AttestationNotConfigured": {
+        "description": "App Attest is not configured on this server (`APP_ATTEST_TEAM_ID` / `APP_ATTEST_BUNDLE_ID` / `TOKEN_SIGNING_KEY` unset). Check `GET /api/capabilities` → `attestation.supported` before calling.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "app attestation is not configured on this server"
+            }
           }
         }
       },
@@ -938,8 +1815,12 @@
         "description": "The server has no credentials for the requested push channel (no VAPID keypair for `webpush`, no APNs key for `apns`). Check `GET /api/push/config`.",
         "content": {
           "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" },
-            "example": { "error": "apns not configured" }
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "apns not configured"
+            }
           }
         }
       },
@@ -947,8 +1828,12 @@
         "description": "No mailbox exists for this address.",
         "content": {
           "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" },
-            "example": { "error": "mailbox not found" }
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "mailbox not found"
+            }
           }
         }
       },
@@ -956,8 +1841,25 @@
         "description": "No such message in this mailbox.",
         "content": {
           "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" },
-            "example": { "error": "message not found" }
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "message not found"
+            }
+          }
+        }
+      },
+      "DomainNotFound": {
+        "description": "No custom-domain claim exists for this domain.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "domain not found"
+            }
           }
         }
       },
@@ -965,45 +1867,240 @@
         "description": "An unexpected server error occurred. Details are logged server-side.",
         "content": {
           "application/json": {
-            "schema": { "$ref": "#/components/schemas/Error" },
-            "example": { "error": "internal server error" }
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "internal server error"
+            }
           }
         }
       }
     },
     "schemas": {
+      "CapabilitiesResponse": {
+        "type": "object",
+        "description": "Feature flags for this server instance. Treat missing keys as `false`.",
+        "required": [
+          "apns_push",
+          "web_push",
+          "custom_domains",
+          "attestation",
+          "entitlements"
+        ],
+        "properties": {
+          "apns_push": {
+            "type": "boolean",
+            "description": "Native iOS push is available (APNs credentials configured)."
+          },
+          "web_push": {
+            "type": "boolean",
+            "description": "Web Push is available (VAPID keypair configured)."
+          },
+          "custom_domains": {
+            "type": "boolean",
+            "description": "The custom-domain endpoints are live (`CUSTOM_DOMAINS_ENABLED`)."
+          },
+          "attestation": {
+            "type": "object",
+            "description": "Client-attestation posture (Apple App Attest). When `required` is `true`, obtain an attested token via `POST /api/client/attest` before any write.",
+            "required": [
+              "supported",
+              "required"
+            ],
+            "properties": {
+              "supported": {
+                "type": "boolean",
+                "description": "The `/api/client/*` attestation endpoints are live."
+              },
+              "required": {
+                "type": "boolean",
+                "description": "Mutating endpoints demand an attested client token."
+              }
+            }
+          },
+          "entitlements": {
+            "type": "object",
+            "description": "Tier policy in force. When `enforced` is `false` clients should unlock everything and show no paywalls (the self-host experience).",
+            "required": [
+              "enforced",
+              "free",
+              "pro"
+            ],
+            "properties": {
+              "enforced": {
+                "type": "boolean",
+                "description": "Free/pro limits are enforced server-side (`ENTITLEMENTS_ENFORCED`)."
+              },
+              "free": {
+                "$ref": "#/components/schemas/TierPolicy"
+              },
+              "pro": {
+                "$ref": "#/components/schemas/TierPolicy"
+              }
+            }
+          }
+        }
+      },
+      "CreateCustomDomainRequest": {
+        "type": "object",
+        "description": "The domain to claim.",
+        "required": [
+          "domain"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "A domain you control, e.g. `mail.mycorp.com`. Lowercased server-side; a trailing dot is tolerated. The server's own domains and their subdomains are rejected.",
+            "examples": [
+              "mail.mycorp.com"
+            ]
+          }
+        }
+      },
+      "DnsCheck": {
+        "type": "object",
+        "description": "The outcome of one DNS verification check.",
+        "required": [
+          "record",
+          "ok",
+          "expected"
+        ],
+        "properties": {
+          "record": {
+            "type": "string",
+            "enum": [
+              "txt",
+              "mx"
+            ],
+            "description": "Which record was checked: the TXT challenge at `_anonymail.<domain>` or the MX at `<domain>`."
+          },
+          "ok": {
+            "type": "boolean",
+            "description": "Whether the expected value was found."
+          },
+          "expected": {
+            "type": "string",
+            "description": "The value the domain owner is expected to publish."
+          },
+          "found": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What DNS actually returned (comma-joined when multiple records exist), or `null` when nothing resolved."
+          }
+        }
+      },
+      "CustomDomain": {
+        "type": "object",
+        "description": "A custom-domain claim. `claim_token` appears only in the create response; `checks` only in verify responses.",
+        "required": [
+          "domain",
+          "status",
+          "txt_record",
+          "mx_target"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "The claimed domain (lowercased).",
+            "examples": [
+              "mail.mycorp.com"
+            ]
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "pending",
+              "verified",
+              "failed"
+            ],
+            "description": "Claim lifecycle: `pending` until DNS checks pass, `verified` while they hold (mail flows), `failed` after they stay broken past the ~48h grace window."
+          },
+          "txt_record": {
+            "type": "string",
+            "description": "Value to publish as a TXT record at `_anonymail.<domain>`.",
+            "examples": [
+              "anonymail-verify=9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c"
+            ]
+          },
+          "mx_target": {
+            "type": "string",
+            "description": "Host the domain's MX record must point at (any priority).",
+            "examples": [
+              "mx.example.com"
+            ]
+          },
+          "claim_token": {
+            "type": "string",
+            "description": "The one-time `amd_…` bearer token that owns this claim. Returned **only** by the create call.",
+            "examples": [
+              "amd_hK3T9qmZ2xWfJ8dLpR5vY0cN1aQ6sB4eU7gIoPkXmVs"
+            ]
+          },
+          "verified_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When DNS checks last passed (UTC). Absent while never verified."
+          },
+          "checks": {
+            "type": "array",
+            "description": "Per-record results of the verification run (verify responses only).",
+            "items": {
+              "$ref": "#/components/schemas/DnsCheck"
+            }
+          }
+        }
+      },
       "CreateAddressRequest": {
         "type": "object",
         "description": "Options for creating a mailbox. Every field is optional; an empty object (or no body) yields a random address on the first configured domain. Unknown fields are ignored.",
         "properties": {
           "local_part": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Custom local part (the portion before `@`). Must be 1–64 characters of `[a-z0-9._-]` and must not start or end with a separator (`.`, `_`, `-`). Lowercased before use. If omitted, a random 10-character local part is generated.",
             "minLength": 1,
             "maxLength": 64,
             "pattern": "^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$",
-            "examples": ["jane.doe"]
+            "examples": [
+              "jane.doe"
+            ]
           },
           "domain": {
-            "type": ["string", "null"],
-            "description": "One of the server's configured domains (see `GET /api/domains`). Defaults to the first configured domain when omitted.",
-            "examples": ["example.com"]
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "One of the server's configured domains (see `GET /api/domains`), or a **verified custom domain** — the latter requires that domain's `amd_…` claim token as the bearer token. Defaults to the first configured domain when omitted.",
+            "examples": [
+              "example.com"
+            ]
           }
         }
       },
       "CreateAddressResponse": {
         "description": "A newly created mailbox plus its one-time owner token.",
         "allOf": [
-          { "$ref": "#/components/schemas/Mailbox" },
+          {
+            "$ref": "#/components/schemas/Mailbox"
+          },
           {
             "type": "object",
-            "required": ["owner_token"],
+            "required": [
+              "owner_token"
+            ],
             "properties": {
               "owner_token": {
                 "type": "string",
                 "description": "Bearer token proving ownership of this mailbox (`am_` + 43 base64url chars). Returned **only** here and from rotate — store it; it cannot be recovered. Required for extend, rotate, and all deletes.",
                 "pattern": "^am_[A-Za-z0-9_-]{43}$",
-                "examples": ["am_hK3T9qmZ2xWfJ8dLpR5vY0cN1aQ6sB4eU7gIoPkXmVs"]
+                "examples": [
+                  "am_hK3T9qmZ2xWfJ8dLpR5vY0cN1aQ6sB4eU7gIoPkXmVs"
+                ]
               }
             }
           }
@@ -1012,124 +2109,183 @@
       "RotateTokenResponse": {
         "type": "object",
         "description": "The replacement owner token issued by a rotate; the previous token is already revoked.",
-        "required": ["owner_token"],
+        "required": [
+          "owner_token"
+        ],
         "properties": {
           "owner_token": {
             "type": "string",
             "description": "The new owner token. Same format and handling rules as at creation.",
             "pattern": "^am_[A-Za-z0-9_-]{43}$",
-            "examples": ["am_Zx8cV2bN4mA6sD1fG3hJ5kL7qW9eR0tY_uIoPaSdFgs"]
+            "examples": [
+              "am_Zx8cV2bN4mA6sD1fG3hJ5kL7qW9eR0tY_uIoPaSdFgs"
+            ]
           }
         }
       },
       "Mailbox": {
         "type": "object",
         "description": "A disposable inbox.",
-        "required": ["address", "domain", "created_at", "expires_at"],
+        "required": [
+          "address",
+          "domain",
+          "created_at",
+          "expires_at"
+        ],
         "properties": {
           "address": {
             "type": "string",
             "format": "email",
             "description": "Full email address of the mailbox (lowercased).",
-            "examples": ["a1b2c3d4e5@example.com"]
+            "examples": [
+              "a1b2c3d4e5@example.com"
+            ]
           },
           "domain": {
             "type": "string",
             "description": "Domain portion of the address.",
-            "examples": ["example.com"]
+            "examples": [
+              "example.com"
+            ]
           },
           "created_at": {
             "type": "string",
             "format": "date-time",
             "description": "When the mailbox was created (UTC).",
-            "examples": ["2026-07-01T11:23:45.123456Z"]
+            "examples": [
+              "2026-07-01T11:23:45.123456Z"
+            ]
           },
           "expires_at": {
             "type": "string",
             "format": "date-time",
             "description": "When the mailbox expires and becomes eligible for purging (UTC).",
-            "examples": ["2026-07-01T12:23:45.123456Z"]
+            "examples": [
+              "2026-07-01T12:23:45.123456Z"
+            ]
           }
         }
       },
       "ClearInboxResponse": {
         "type": "object",
         "description": "Result of clearing a mailbox.",
-        "required": ["deleted"],
+        "required": [
+          "deleted"
+        ],
         "properties": {
           "deleted": {
             "type": "integer",
             "format": "int64",
             "description": "Number of messages that were deleted.",
-            "examples": [4]
+            "examples": [
+              4
+            ]
           }
         }
       },
       "MessageSummary": {
         "type": "object",
         "description": "Lightweight message representation used in inbox listings (no bodies or attachment metadata).",
-        "required": ["id", "mail_from", "subject", "received_at", "has_attachments", "seen"],
+        "required": [
+          "id",
+          "mail_from",
+          "subject",
+          "received_at",
+          "has_attachments",
+          "seen"
+        ],
         "properties": {
           "id": {
             "type": "string",
             "format": "uuid",
             "description": "Message identifier.",
-            "examples": ["550e8400-e29b-41d4-a716-446655440000"]
+            "examples": [
+              "550e8400-e29b-41d4-a716-446655440000"
+            ]
           },
           "mail_from": {
             "type": "string",
             "description": "SMTP envelope sender (MAIL FROM) of the message.",
-            "examples": ["billing@shop.test"]
+            "examples": [
+              "billing@shop.test"
+            ]
           },
           "subject": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Message subject, or null if the email had no Subject header.",
-            "examples": ["Invoice #1042"]
+            "examples": [
+              "Invoice #1042"
+            ]
           },
           "received_at": {
             "type": "string",
             "format": "date-time",
             "description": "When the server received and stored the message (UTC).",
-            "examples": ["2026-07-01T11:24:10.000000Z"]
+            "examples": [
+              "2026-07-01T11:24:10.000000Z"
+            ]
           },
           "has_attachments": {
             "type": "boolean",
             "description": "True if the message has one or more attachments.",
-            "examples": [true]
+            "examples": [
+              true
+            ]
           },
           "seen": {
             "type": "boolean",
             "description": "True once the message was marked read via the read endpoint.",
-            "examples": [false]
+            "examples": [
+              false
+            ]
           }
         }
       },
       "AttachmentMeta": {
         "type": "object",
         "description": "Attachment metadata returned alongside a full message. Download the bytes via the attachment endpoint.",
-        "required": ["id", "filename", "content_type", "size"],
+        "required": [
+          "id",
+          "filename",
+          "content_type",
+          "size"
+        ],
         "properties": {
           "id": {
             "type": "string",
             "format": "uuid",
             "description": "Attachment identifier; use it in the download URL.",
-            "examples": ["3fa85f64-5717-4562-b3fc-2c963f66afa6"]
+            "examples": [
+              "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+            ]
           },
           "filename": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Original filename, or null if the part had none.",
-            "examples": ["invoice-1042.pdf"]
+            "examples": [
+              "invoice-1042.pdf"
+            ]
           },
           "content_type": {
             "type": "string",
             "description": "MIME type of the attachment as parsed from the message.",
-            "examples": ["application/pdf"]
+            "examples": [
+              "application/pdf"
+            ]
           },
           "size": {
             "type": "integer",
             "format": "int32",
             "description": "Size of the attachment content in bytes.",
-            "examples": [18240]
+            "examples": [
+              18240
+            ]
           }
         }
       },
@@ -1154,190 +2310,286 @@
             "type": "string",
             "format": "uuid",
             "description": "Message identifier.",
-            "examples": ["550e8400-e29b-41d4-a716-446655440000"]
+            "examples": [
+              "550e8400-e29b-41d4-a716-446655440000"
+            ]
           },
           "mailbox_address": {
             "type": "string",
             "format": "email",
             "description": "Address of the mailbox this message belongs to.",
-            "examples": ["a1b2c3d4e5@example.com"]
+            "examples": [
+              "a1b2c3d4e5@example.com"
+            ]
           },
           "mail_from": {
             "type": "string",
             "description": "SMTP envelope sender (MAIL FROM) of the message.",
-            "examples": ["billing@shop.test"]
+            "examples": [
+              "billing@shop.test"
+            ]
           },
           "subject": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Message subject, or null if absent.",
-            "examples": ["Invoice #1042"]
+            "examples": [
+              "Invoice #1042"
+            ]
           },
           "message_date": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "format": "date-time",
             "description": "Date parsed from the message's Date header (UTC), or null if missing/unparseable.",
-            "examples": ["2026-07-01T11:24:05.000000Z"]
+            "examples": [
+              "2026-07-01T11:24:05.000000Z"
+            ]
           },
           "text_body": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Plain-text body, or null if the message had none.",
-            "examples": ["Thanks for your order. Your invoice is attached."]
+            "examples": [
+              "Thanks for your order. Your invoice is attached."
+            ]
           },
           "html_body": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "HTML body, or null if the message had none. UNTRUSTED, attacker-controlled markup: anyone can email this mailbox, and the server stores and returns the HTML verbatim. Never inject it into a live DOM — render it inside a sandboxed iframe (`<iframe sandbox>` without `allow-scripts`) or sanitize it first (e.g. DOMPurify), and block remote content by default.",
-            "examples": ["<p>Thanks for your order. Your invoice is attached.</p>"]
+            "examples": [
+              "<p>Thanks for your order. Your invoice is attached.</p>"
+            ]
           },
           "raw_size": {
             "type": "integer",
             "format": "int32",
             "description": "Size in bytes of the raw message as received over SMTP (DATA phase).",
-            "examples": [20841]
+            "examples": [
+              20841
+            ]
           },
           "received_at": {
             "type": "string",
             "format": "date-time",
             "description": "When the server received and stored the message (UTC).",
-            "examples": ["2026-07-01T11:24:10.000000Z"]
+            "examples": [
+              "2026-07-01T11:24:10.000000Z"
+            ]
           },
           "seen": {
             "type": "boolean",
             "description": "True once the message was marked read via the read endpoint.",
-            "examples": [false]
+            "examples": [
+              false
+            ]
           },
           "attachments": {
             "type": "array",
             "description": "Attachment metadata (bytes downloaded separately). Empty when there are none.",
-            "items": { "$ref": "#/components/schemas/AttachmentMeta" }
+            "items": {
+              "$ref": "#/components/schemas/AttachmentMeta"
+            }
           }
         }
       },
       "MailEvent": {
         "type": "object",
         "description": "Payload delivered in the `data` field of each SSE `message` event. Mirrors a MessageSummary plus the target `address` and the server-extracted verification code, giving enough to render an inbox row immediately; treat the REST listing as authoritative.",
-        "required": ["address", "id", "mail_from", "subject", "received_at", "has_attachments", "code"],
+        "required": [
+          "address",
+          "id",
+          "mail_from",
+          "subject",
+          "received_at",
+          "has_attachments",
+          "code"
+        ],
         "properties": {
           "address": {
             "type": "string",
             "format": "email",
             "description": "The mailbox address the message arrived for.",
-            "examples": ["a1b2c3d4e5@example.com"]
+            "examples": [
+              "a1b2c3d4e5@example.com"
+            ]
           },
           "id": {
             "type": "string",
             "format": "uuid",
             "description": "Identifier of the newly stored message.",
-            "examples": ["550e8400-e29b-41d4-a716-446655440000"]
+            "examples": [
+              "550e8400-e29b-41d4-a716-446655440000"
+            ]
           },
           "mail_from": {
             "type": "string",
             "description": "SMTP envelope sender (MAIL FROM) of the message.",
-            "examples": ["billing@shop.test"]
+            "examples": [
+              "billing@shop.test"
+            ]
           },
           "subject": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "Message subject, or null if absent.",
-            "examples": ["Invoice #1042"]
+            "examples": [
+              "Invoice #1042"
+            ]
           },
           "received_at": {
             "type": "string",
             "format": "date-time",
             "description": "When the server received and stored the message (UTC).",
-            "examples": ["2026-07-01T11:24:10.000000Z"]
+            "examples": [
+              "2026-07-01T11:24:10.000000Z"
+            ]
           },
           "has_attachments": {
             "type": "boolean",
             "description": "True if the message has one or more attachments.",
-            "examples": [true]
+            "examples": [
+              true
+            ]
           },
           "code": {
-            "type": ["string", "null"],
+            "type": [
+              "string",
+              "null"
+            ],
             "description": "OTP / verification code the server extracted from the subject or text body, or null if none was detected. Normalized to bare digits for numeric codes (e.g. `G-482913` becomes `482913`).",
-            "examples": ["483920"]
+            "examples": [
+              "483920"
+            ]
           }
         }
       },
       "VapidPublicKeyResponse": {
         "type": "object",
         "description": "The server's VAPID public key for `PushManager.subscribe`.",
-        "required": ["vapid_public_key"],
+        "required": [
+          "vapid_public_key"
+        ],
         "properties": {
           "vapid_public_key": {
             "type": "string",
             "description": "Base64url-encoded uncompressed P-256 public key.",
-            "examples": ["BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM"]
+            "examples": [
+              "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM"
+            ]
           }
         }
       },
       "PushConfigResponse": {
         "type": "object",
         "description": "Which push channels this server can deliver on.",
-        "required": ["webpush", "apns"],
+        "required": [
+          "webpush",
+          "apns"
+        ],
         "properties": {
           "webpush": {
             "type": "boolean",
             "description": "True when a VAPID keypair is configured (browsers/PWAs).",
-            "examples": [true]
+            "examples": [
+              true
+            ]
           },
           "apns": {
             "type": "boolean",
             "description": "True when APNs credentials are configured (native iOS apps).",
-            "examples": [true]
+            "examples": [
+              true
+            ]
           }
         }
       },
       "SubscriptionKind": {
         "type": "string",
-        "enum": ["webpush", "apns"],
+        "enum": [
+          "webpush",
+          "apns"
+        ],
         "description": "Push channel: `webpush` (W3C Web Push with VAPID) or `apns` (Apple Push Notification service)."
       },
       "SubscribeRequest": {
         "type": "object",
         "description": "A push subscription of either kind. Web Push: `{ endpoint, keys }`, exactly as produced by `PushSubscription.toJSON()`. APNs: `{ device_token }`. `kind` is optional and inferred from which identifier is present.",
         "properties": {
-          "kind": { "$ref": "#/components/schemas/SubscriptionKind" },
+          "kind": {
+            "$ref": "#/components/schemas/SubscriptionKind"
+          },
           "endpoint": {
             "type": "string",
             "format": "uri",
             "description": "Web Push only: HTTPS push-service URL unique to this device/browser.",
-            "examples": ["https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..."]
+            "examples": [
+              "https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..."
+            ]
           },
           "keys": {
             "type": "object",
             "description": "Web Push only.",
-            "required": ["p256dh", "auth"],
+            "required": [
+              "p256dh",
+              "auth"
+            ],
             "properties": {
               "p256dh": {
                 "type": "string",
                 "description": "Client public key (base64url).",
-                "examples": ["BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM"]
+                "examples": [
+                  "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM"
+                ]
               },
               "auth": {
                 "type": "string",
                 "description": "Client auth secret (base64url).",
-                "examples": ["tBHItJI5svbpez7KI4CCXg"]
+                "examples": [
+                  "tBHItJI5svbpez7KI4CCXg"
+                ]
               }
             }
           },
           "device_token": {
             "type": "string",
             "description": "APNs only: the hex device token from `didRegisterForRemoteNotificationsWithDeviceToken`.",
-            "examples": ["a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"]
+            "examples": [
+              "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+            ]
           }
         }
       },
       "SubscribeResponse": {
         "type": "object",
         "description": "Confirmation of a registered push subscription.",
-        "required": ["id", "kind"],
+        "required": [
+          "id",
+          "kind"
+        ],
         "properties": {
           "id": {
             "type": "string",
             "format": "uuid",
             "description": "Server-side id of the subscription (stable across re-subscribes of the same endpoint/token).",
-            "examples": ["8f14e45f-ceea-467f-a34e-9b7f7c3d9d10"]
+            "examples": [
+              "8f14e45f-ceea-467f-a34e-9b7f7c3d9d10"
+            ]
           },
-          "kind": { "$ref": "#/components/schemas/SubscriptionKind" }
+          "kind": {
+            "$ref": "#/components/schemas/SubscriptionKind"
+          }
         }
       },
       "UnsubscribeRequest": {
@@ -1348,61 +2600,244 @@
             "type": "string",
             "format": "uri",
             "description": "The push-service URL used at registration (Web Push).",
-            "examples": ["https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..."]
+            "examples": [
+              "https://fcm.googleapis.com/fcm/send/dpH5lCsTSSM:APA91bH..."
+            ]
           },
           "device_token": {
             "type": "string",
             "description": "The device token used at registration (APNs).",
-            "examples": ["a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"]
+            "examples": [
+              "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2"
+            ]
           }
         }
       },
       "DomainsResponse": {
         "type": "object",
         "description": "The set of domains the server accepts mail for.",
-        "required": ["domains"],
+        "required": [
+          "domains"
+        ],
         "properties": {
           "domains": {
             "type": "array",
             "description": "Configured domains; the first is the default for address creation.",
-            "items": { "type": "string" },
-            "examples": [["example.com"]]
+            "items": {
+              "type": "string"
+            },
+            "examples": [
+              [
+                "example.com"
+              ]
+            ]
           }
         }
       },
       "HealthResponse": {
         "type": "object",
         "description": "Health-check payload.",
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "properties": {
           "status": {
             "type": "string",
             "description": "Always `\"ok\"` when the server is healthy.",
-            "examples": ["ok"]
+            "examples": [
+              "ok"
+            ]
           }
         }
       },
       "ReadyResponse": {
         "type": "object",
         "description": "Readiness-check payload.",
-        "required": ["status"],
+        "required": [
+          "status"
+        ],
         "properties": {
           "status": {
             "type": "string",
             "description": "Always `\"ready\"` when the storage backend answers queries.",
-            "examples": ["ready"]
+            "examples": [
+              "ready"
+            ]
           }
         }
       },
       "Error": {
         "type": "object",
         "description": "Uniform error envelope returned on any non-2xx response.",
-        "required": ["error"],
+        "required": [
+          "error"
+        ],
         "properties": {
           "error": {
             "type": "string",
             "description": "Human-readable error message.",
-            "examples": ["mailbox not found"]
+            "examples": [
+              "mailbox not found"
+            ]
+          },
+          "code": {
+            "type": "string",
+            "description": "Optional machine-readable rejection code, present on policy errors: `pro_required`, `lifetime_cap`, `client_token_expired`, `client_token_invalid`. More codes may be added; ignore unknown ones.",
+            "examples": [
+              "pro_required"
+            ]
+          }
+        }
+      },
+      "TierPolicy": {
+        "type": "object",
+        "description": "What one tier may do when entitlements are enforced. Clients should drive their gates and paywall copy from these numbers instead of hardcoding them.",
+        "required": [
+          "active_mailboxes",
+          "max_lifetime_seconds",
+          "custom_local_parts",
+          "domain_count",
+          "custom_domains"
+        ],
+        "properties": {
+          "active_mailboxes": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Active-mailbox cap per attested device (`0` = unlimited). Reported now; enforced once attestation ships."
+          },
+          "max_lifetime_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Ceiling on a mailbox's total lifetime (`expires_at - created_at`) including extends, in seconds. `0` = unlimited."
+          },
+          "custom_local_parts": {
+            "type": "boolean",
+            "description": "May pick the local part instead of getting a random one."
+          },
+          "domain_count": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many of the configured domains are usable, counted from the front of the `GET /api/domains` list. `0` = all."
+          },
+          "custom_domains": {
+            "type": "boolean",
+            "description": "May claim bring-your-own domains."
+          }
+        }
+      },
+      "VerifyEntitlementsRequest": {
+        "type": "object",
+        "description": "Optional purchase proof. Omit the body (or the id) to mint a free-tier token.",
+        "properties": {
+          "rc_app_user_id": {
+            "type": "string",
+            "description": "The app's anonymous RevenueCat app-user id. The server checks the pro entitlement against RevenueCat and caches the verdict briefly.",
+            "examples": [
+              "$RCAnonymousID:87c6049c58069238dce29853f60e2c62"
+            ]
+          }
+        }
+      },
+      "ClientTokenResponse": {
+        "type": "object",
+        "description": "A freshly minted client token — from `POST /api/entitlements/verify` (unattested) or the attest/assert endpoints (attested). Send it as `X-Client-Token` on writes; refresh via the endpoint that minted it when it nears `expires_at`.",
+        "required": [
+          "client_token",
+          "tier",
+          "expires_at"
+        ],
+        "properties": {
+          "client_token": {
+            "type": "string",
+            "description": "Signed tier token (JWT, HS256). Attested tokens additionally carry the device key id."
+          },
+          "tier": {
+            "type": "string",
+            "enum": [
+              "free",
+              "pro"
+            ],
+            "description": "The tier embedded in the token."
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When the token stops validating (~12h)."
+          }
+        }
+      },
+      "ChallengeResponse": {
+        "type": "object",
+        "description": "A single-use App Attest challenge.",
+        "required": [
+          "challenge",
+          "expires_in"
+        ],
+        "properties": {
+          "challenge": {
+            "type": "string",
+            "description": "Opaque base64url string. Hash it (SHA-256 of the UTF-8 bytes) into the `clientDataHash` for `DCAppAttestService`, and echo it verbatim in the attest/assert request."
+          },
+          "expires_in": {
+            "type": "integer",
+            "description": "Seconds until the challenge expires.",
+            "examples": [
+              300
+            ]
+          }
+        }
+      },
+      "AttestRequest": {
+        "type": "object",
+        "description": "One-time App Attest device registration.",
+        "required": [
+          "key_id",
+          "attestation",
+          "challenge"
+        ],
+        "properties": {
+          "key_id": {
+            "type": "string",
+            "description": "Base64 key id returned by `DCAppAttestService.generateKey`."
+          },
+          "attestation": {
+            "type": "string",
+            "description": "Base64-encoded CBOR attestation object from `attestKey(_:clientDataHash:)`."
+          },
+          "challenge": {
+            "type": "string",
+            "description": "The challenge (verbatim) whose SHA-256 was used as `clientDataHash`."
+          },
+          "rc_app_user_id": {
+            "type": "string",
+            "description": "Optional anonymous RevenueCat app-user id for the tier check; omit for a free-tier token."
+          }
+        }
+      },
+      "AssertRequest": {
+        "type": "object",
+        "description": "Assertion-based refresh for an already-attested device.",
+        "required": [
+          "key_id",
+          "assertion",
+          "challenge"
+        ],
+        "properties": {
+          "key_id": {
+            "type": "string",
+            "description": "The key id registered via `POST /api/client/attest`."
+          },
+          "assertion": {
+            "type": "string",
+            "description": "Base64-encoded CBOR assertion from `generateAssertion(_:clientDataHash:)`."
+          },
+          "challenge": {
+            "type": "string",
+            "description": "The challenge (verbatim) whose SHA-256 was used as `clientDataHash`."
+          },
+          "rc_app_user_id": {
+            "type": "string",
+            "description": "Optional anonymous RevenueCat app-user id for the tier check; omit for a free-tier token."
           }
         }
       }

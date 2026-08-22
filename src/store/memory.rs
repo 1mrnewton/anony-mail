@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use super::{MailboxQuotas, Store, SubscriptionLimit, UniqueViolation};
 use crate::model::{
-    Attachment, AttachmentMeta, Mailbox, MessageSummary, NewMessage, PushSubscription,
-    StoredMessage, SubscriptionKind,
+    Attachment, AttachmentMeta, AttestedDevice, CustomDomain, CustomDomainStatus, Mailbox,
+    MessageSummary, NewMessage, PushSubscription, StoredMessage, SubscriptionKind,
 };
 
 /// In-memory [`Store`], primarily for tests and local development without a
@@ -25,6 +25,8 @@ struct Inner {
     mailboxes: HashMap<String, Mailbox>,
     messages: Vec<Entry>,
     subscriptions: Vec<PushSubscription>,
+    custom_domains: HashMap<String, CustomDomain>,
+    attested_devices: HashMap<String, AttestedDevice>,
 }
 
 struct Entry {
@@ -99,6 +101,7 @@ impl Store for MemoryStore {
         domain: &str,
         expires_at: DateTime<Utc>,
         owner_token_hash: Option<&str>,
+        creator_device_hash: Option<&str>,
     ) -> Result<Mailbox> {
         let mut inner = self.inner.lock().unwrap();
         if inner.mailboxes.contains_key(address) {
@@ -110,6 +113,7 @@ impl Store for MemoryStore {
             created_at: Utc::now(),
             expires_at,
             owner_token_hash: owner_token_hash.map(String::from),
+            creator_device_hash: creator_device_hash.map(String::from),
         };
         inner.mailboxes.insert(address.to_string(), mailbox.clone());
         Ok(mailbox)
@@ -392,6 +396,100 @@ impl Store for MemoryStore {
         Ok(sub)
     }
 
+    async fn create_custom_domain(
+        &self,
+        domain: &str,
+        claim_token_hash: &str,
+        txt_token: &str,
+    ) -> Result<CustomDomain> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.custom_domains.contains_key(domain) {
+            return Err(UniqueViolation(format!("domain already claimed: {domain}")).into());
+        }
+        let record = CustomDomain {
+            domain: domain.to_string(),
+            status: CustomDomainStatus::Pending,
+            claim_token_hash: claim_token_hash.to_string(),
+            txt_token: txt_token.to_string(),
+            created_at: Utc::now(),
+            verified_at: None,
+            last_checked_at: None,
+        };
+        inner
+            .custom_domains
+            .insert(domain.to_string(), record.clone());
+        Ok(record)
+    }
+
+    async fn get_custom_domain(&self, domain: &str) -> Result<Option<CustomDomain>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .custom_domains
+            .get(domain)
+            .cloned())
+    }
+
+    async fn delete_custom_domain(&self, domain: &str) -> Result<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .custom_domains
+            .remove(domain)
+            .is_some())
+    }
+
+    async fn custom_domain_is_verified(&self, domain: &str) -> Result<bool> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .custom_domains
+            .get(domain)
+            .is_some_and(|d| d.status == CustomDomainStatus::Verified))
+    }
+
+    async fn record_custom_domain_check(
+        &self,
+        domain: &str,
+        status: CustomDomainStatus,
+        verified_at: Option<DateTime<Utc>>,
+        checked_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.custom_domains.get_mut(domain) {
+            Some(d) => {
+                d.status = status;
+                d.verified_at = verified_at;
+                d.last_checked_at = Some(checked_at);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    async fn list_custom_domains_to_recheck(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<CustomDomain>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .custom_domains
+            .values()
+            .filter(|d| {
+                matches!(
+                    d.status,
+                    CustomDomainStatus::Verified | CustomDomainStatus::Failed
+                ) && d.last_checked_at.is_none_or(|t| t <= cutoff)
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn list_subscriptions(&self, address: &str) -> Result<Vec<PushSubscription>> {
         Ok(self
             .inner
@@ -411,5 +509,79 @@ impl Store for MemoryStore {
             .subscriptions
             .retain(|s| !(s.mailbox_address == address && s.endpoint == endpoint));
         Ok(inner.subscriptions.len() != before)
+    }
+
+    async fn upsert_attested_device(
+        &self,
+        key_id: &str,
+        public_key: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AttestedDevice> {
+        let mut inner = self.inner.lock().unwrap();
+        let device = inner
+            .attested_devices
+            .entry(key_id.to_string())
+            .and_modify(|d| d.last_seen_at = now)
+            .or_insert_with(|| AttestedDevice {
+                key_id: key_id.to_string(),
+                public_key: public_key.to_vec(),
+                counter: 0,
+                created_at: now,
+                last_seen_at: now,
+            });
+        Ok(device.clone())
+    }
+
+    async fn get_attested_device(&self, key_id: &str) -> Result<Option<AttestedDevice>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .attested_devices
+            .get(key_id)
+            .cloned())
+    }
+
+    async fn advance_attested_device_counter(
+        &self,
+        key_id: &str,
+        counter: i64,
+        seen_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        match inner.attested_devices.get_mut(key_id) {
+            Some(d) if counter > d.counter => {
+                d.counter = counter;
+                d.last_seen_at = seen_at;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn prune_attested_devices(&self, idle_before: DateTime<Utc>) -> Result<u64> {
+        let mut inner = self.inner.lock().unwrap();
+        let before = inner.attested_devices.len();
+        inner
+            .attested_devices
+            .retain(|_, d| d.last_seen_at >= idle_before);
+        Ok((before - inner.attested_devices.len()) as u64)
+    }
+
+    async fn count_active_mailboxes_by_device(
+        &self,
+        creator_device_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<u64> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .mailboxes
+            .values()
+            .filter(|m| {
+                m.creator_device_hash.as_deref() == Some(creator_device_hash) && m.expires_at > now
+            })
+            .count() as u64)
     }
 }

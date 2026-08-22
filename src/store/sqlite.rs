@@ -11,8 +11,8 @@ use uuid::Uuid;
 
 use super::{MailboxQuotas, Store, SubscriptionLimit};
 use crate::model::{
-    Attachment, AttachmentMeta, Mailbox, MessageSummary, NewMessage, PushSubscription,
-    StoredMessage, SubscriptionKind,
+    Attachment, AttachmentMeta, AttestedDevice, CustomDomain, CustomDomainStatus, Mailbox,
+    MessageSummary, NewMessage, PushSubscription, StoredMessage, SubscriptionKind,
 };
 
 /// SQLite-backed [`Store`] implementation using `sqlx`.
@@ -124,6 +124,7 @@ struct MailboxRow {
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     owner_token_hash: Option<String>,
+    creator_device_hash: Option<String>,
 }
 
 impl From<MailboxRow> for Mailbox {
@@ -134,6 +135,28 @@ impl From<MailboxRow> for Mailbox {
             created_at: r.created_at,
             expires_at: r.expires_at,
             owner_token_hash: r.owner_token_hash,
+            creator_device_hash: r.creator_device_hash,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct AttestedDeviceRow {
+    key_id: String,
+    public_key: Vec<u8>,
+    counter: i64,
+    created_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+}
+
+impl From<AttestedDeviceRow> for AttestedDevice {
+    fn from(r: AttestedDeviceRow) -> Self {
+        AttestedDevice {
+            key_id: r.key_id,
+            public_key: r.public_key,
+            counter: r.counter,
+            created_at: r.created_at,
+            last_seen_at: r.last_seen_at,
         }
     }
 }
@@ -197,6 +220,33 @@ impl TryFrom<PushSubscriptionRow> for PushSubscription {
     }
 }
 
+#[derive(sqlx::FromRow)]
+struct CustomDomainRow {
+    domain: String,
+    claim_token_hash: String,
+    txt_token: String,
+    status: String,
+    created_at: DateTime<Utc>,
+    verified_at: Option<DateTime<Utc>>,
+    last_checked_at: Option<DateTime<Utc>>,
+}
+
+impl TryFrom<CustomDomainRow> for CustomDomain {
+    type Error = anyhow::Error;
+
+    fn try_from(r: CustomDomainRow) -> Result<Self> {
+        Ok(CustomDomain {
+            domain: r.domain,
+            status: r.status.parse()?,
+            claim_token_hash: r.claim_token_hash,
+            txt_token: r.txt_token,
+            created_at: r.created_at,
+            verified_at: r.verified_at,
+            last_checked_at: r.last_checked_at,
+        })
+    }
+}
+
 #[async_trait]
 impl Store for SqliteStore {
     async fn create_mailbox(
@@ -205,17 +255,21 @@ impl Store for SqliteStore {
         domain: &str,
         expires_at: DateTime<Utc>,
         owner_token_hash: Option<&str>,
+        creator_device_hash: Option<&str>,
     ) -> Result<Mailbox> {
         let created_at = Utc::now();
         sqlx::query(
-            "INSERT INTO mailboxes (address, domain, created_at, expires_at, owner_token_hash)
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO mailboxes
+                 (address, domain, created_at, expires_at, owner_token_hash,
+                  creator_device_hash)
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(address)
         .bind(domain)
         .bind(created_at)
         .bind(expires_at)
         .bind(owner_token_hash)
+        .bind(creator_device_hash)
         .execute(&self.pool)
         .await?;
 
@@ -225,12 +279,14 @@ impl Store for SqliteStore {
             created_at,
             expires_at,
             owner_token_hash: owner_token_hash.map(String::from),
+            creator_device_hash: creator_device_hash.map(String::from),
         })
     }
 
     async fn get_mailbox(&self, address: &str) -> Result<Option<Mailbox>> {
         let row = sqlx::query_as::<_, MailboxRow>(
-            "SELECT address, domain, created_at, expires_at, owner_token_hash
+            "SELECT address, domain, created_at, expires_at, owner_token_hash,
+                    creator_device_hash
              FROM mailboxes WHERE address = ?",
         )
         .bind(address)
@@ -644,6 +700,105 @@ impl Store for SqliteStore {
         })
     }
 
+    async fn create_custom_domain(
+        &self,
+        domain: &str,
+        claim_token_hash: &str,
+        txt_token: &str,
+    ) -> Result<CustomDomain> {
+        let created_at = Utc::now();
+        sqlx::query(
+            "INSERT INTO custom_domains (domain, claim_token_hash, txt_token, status, created_at)
+             VALUES (?, ?, ?, 'pending', ?)",
+        )
+        .bind(domain)
+        .bind(claim_token_hash)
+        .bind(txt_token)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(CustomDomain {
+            domain: domain.to_string(),
+            status: CustomDomainStatus::Pending,
+            claim_token_hash: claim_token_hash.to_string(),
+            txt_token: txt_token.to_string(),
+            created_at,
+            verified_at: None,
+            last_checked_at: None,
+        })
+    }
+
+    async fn get_custom_domain(&self, domain: &str) -> Result<Option<CustomDomain>> {
+        let row: Option<CustomDomainRow> = sqlx::query_as(
+            "SELECT domain, claim_token_hash, txt_token, status,
+                    created_at, verified_at, last_checked_at
+             FROM custom_domains WHERE domain = ?",
+        )
+        .bind(domain)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(TryInto::try_into).transpose()
+    }
+
+    async fn delete_custom_domain(&self, domain: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM custom_domains WHERE domain = ?")
+            .bind(domain)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn custom_domain_is_verified(&self, domain: &str) -> Result<bool> {
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(
+                 SELECT 1 FROM custom_domains WHERE domain = ? AND status = 'verified'
+             )",
+        )
+        .bind(domain)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
+    async fn record_custom_domain_check(
+        &self,
+        domain: &str,
+        status: CustomDomainStatus,
+        verified_at: Option<DateTime<Utc>>,
+        checked_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE custom_domains
+             SET status = ?, verified_at = ?, last_checked_at = ?
+             WHERE domain = ?",
+        )
+        .bind(status.as_str())
+        .bind(verified_at)
+        .bind(checked_at)
+        .bind(domain)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn list_custom_domains_to_recheck(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<CustomDomain>> {
+        let rows: Vec<CustomDomainRow> = sqlx::query_as(
+            "SELECT domain, claim_token_hash, txt_token, status,
+                    created_at, verified_at, last_checked_at
+             FROM custom_domains
+             WHERE status IN ('verified', 'failed')
+               AND (last_checked_at IS NULL OR last_checked_at <= ?)",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TryInto::try_into).collect()
+    }
+
     async fn list_subscriptions(&self, address: &str) -> Result<Vec<PushSubscription>> {
         let rows: Vec<PushSubscriptionRow> = sqlx::query_as(
             "SELECT id, mailbox_address, kind, endpoint, p256dh, auth, created_at
@@ -664,5 +819,86 @@ impl Store for SqliteStore {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    async fn upsert_attested_device(
+        &self,
+        key_id: &str,
+        public_key: &[u8],
+        now: DateTime<Utc>,
+    ) -> Result<AttestedDevice> {
+        // Re-attesting a known key keeps the stored counter (resetting it
+        // would reopen the replay window) and refreshes last_seen_at.
+        let row: AttestedDeviceRow = sqlx::query_as(
+            "INSERT INTO attested_devices
+                 (key_id, public_key, counter, created_at, last_seen_at)
+             VALUES (?, ?, 0, ?, ?)
+             ON CONFLICT(key_id) DO UPDATE SET last_seen_at = excluded.last_seen_at
+             RETURNING key_id, public_key, counter, created_at, last_seen_at",
+        )
+        .bind(key_id)
+        .bind(public_key)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.into())
+    }
+
+    async fn get_attested_device(&self, key_id: &str) -> Result<Option<AttestedDevice>> {
+        let row: Option<AttestedDeviceRow> = sqlx::query_as(
+            "SELECT key_id, public_key, counter, created_at, last_seen_at
+             FROM attested_devices WHERE key_id = ?",
+        )
+        .bind(key_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn advance_attested_device_counter(
+        &self,
+        key_id: &str,
+        counter: i64,
+        seen_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        // The strictly-greater guard makes the database the serialization
+        // point: of two concurrent assertions carrying the same counter,
+        // exactly one wins.
+        let res = sqlx::query(
+            "UPDATE attested_devices SET counter = ?, last_seen_at = ?
+             WHERE key_id = ? AND counter < ?",
+        )
+        .bind(counter)
+        .bind(seen_at)
+        .bind(key_id)
+        .bind(counter)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn prune_attested_devices(&self, idle_before: DateTime<Utc>) -> Result<u64> {
+        let res = sqlx::query("DELETE FROM attested_devices WHERE last_seen_at < ?")
+            .bind(idle_before)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn count_active_mailboxes_by_device(
+        &self,
+        creator_device_hash: &str,
+        now: DateTime<Utc>,
+    ) -> Result<u64> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM mailboxes
+             WHERE creator_device_hash = ? AND expires_at > ?",
+        )
+        .bind(creator_device_hash)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count.max(0) as u64)
     }
 }

@@ -104,6 +104,7 @@ pub async fn subscribe(
     }
 
     let address = address.to_ascii_lowercase();
+    super::entitlements::attestation_gate(&state, &headers)?;
     authorize_owner(&state, &address, &headers).await?;
 
     match state
@@ -160,6 +161,7 @@ pub async fn unsubscribe(
     };
 
     let address = address.to_ascii_lowercase();
+    super::entitlements::attestation_gate(&state, &headers)?;
     authorize_owner(&state, &address, &headers).await?;
 
     if state

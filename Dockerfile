@@ -6,9 +6,10 @@ WORKDIR /app
 
 # build-essential provides the C toolchain needed by the `ring` crypto crate;
 # pkg-config + libssl-dev are required by openssl-sys (web-push's payload
-# encryption via the `ece` crate links against OpenSSL).
+# encryption via the `ece` crate links against OpenSSL); cmake builds
+# aws-lc-sys (crypto backend of the `appattest` App Attest verifier).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev \
+    && apt-get install -y --no-install-recommends build-essential pkg-config libssl-dev cmake \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
