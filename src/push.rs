@@ -230,10 +230,8 @@ impl PushSender for ApnsSender {
             .set_body(&body)
             .set_sound("default");
 
-        let options = a2::NotificationOptions {
-            apns_topic: Some(&self.topic),
-            ..Default::default()
-        };
+        let collapse = payload.id.to_string();
+        let options = apns_notification_options(&self.topic, &collapse);
         let mut apns_payload = builder.build(&subscription.endpoint, options);
         // Custom data mirrors the Web Push JSON so the app can deep-link and
         // copy the code without fetching first.
@@ -250,14 +248,25 @@ impl PushSender for ApnsSender {
                     reason,
                     Some(a2::ErrorReason::Unregistered | a2::ErrorReason::BadDeviceToken)
                 ) {
+                    warn!(
+                        status = response.code,
+                        ?reason,
+                        address = %payload.address,
+                        "APNs token gone; pruning subscription"
+                    );
                     PushOutcome::Gone
                 } else {
-                    debug!(?reason, token = %subscription.endpoint, "APNs rejected notification");
+                    warn!(
+                        status = response.code,
+                        ?reason,
+                        address = %payload.address,
+                        "APNs rejected notification"
+                    );
                     PushOutcome::TransientFailure
                 }
             }
             Err(e) => {
-                debug!(error = %e, token = %subscription.endpoint, "APNs send failed");
+                warn!(error = %e, address = %payload.address, "APNs send failed");
                 PushOutcome::TransientFailure
             }
         }
@@ -282,6 +291,21 @@ pub async fn run(store: Arc<dyn Store>, events: EventBus, senders: Senders) {
     }
 }
 
+/// Headers Apple requires on token-authenticated HTTP/2 alerts. Omitting
+/// `apns-push-type` is rejected with `400 MissingPushType` (a2 0.10 does not
+/// even deserialize that reason, so the failure used to look like a bare 400).
+fn apns_notification_options<'a>(
+    topic: &'a str,
+    collapse_id: &'a str,
+) -> a2::NotificationOptions<'a> {
+    a2::NotificationOptions {
+        apns_topic: Some(topic),
+        apns_push_type: Some(a2::PushType::Alert),
+        apns_collapse_id: a2::CollapseId::new(collapse_id).ok(),
+        ..Default::default()
+    }
+}
+
 /// Send one event to every subscription of its mailbox and prune dead ones.
 /// Each subscription is routed to the sender for its kind; kinds without a
 /// configured sender are skipped. Concurrency is naturally bounded by the
@@ -295,6 +319,7 @@ pub async fn deliver(store: &Arc<dyn Store>, senders: &Senders, event: &MailEven
         }
     };
     if subscriptions.is_empty() {
+        debug!(address = %event.address, "no push subscriptions; skipping");
         return;
     }
 
@@ -321,6 +346,12 @@ pub async fn deliver(store: &Arc<dyn Store>, senders: &Senders, event: &MailEven
     .await;
 
     for (sub, outcome) in results {
+        info!(
+            address = %event.address,
+            kind = sub.kind.as_str(),
+            ?outcome,
+            "push send"
+        );
         if outcome == PushOutcome::Gone {
             match store
                 .delete_subscription(&sub.mailbox_address, &sub.endpoint)
@@ -373,5 +404,18 @@ mod tests {
         assert_eq!(title, "New mail");
         let (title, _) = payload(Some("   "), None, "x@y.z").alert();
         assert_eq!(title, "New mail");
+    }
+
+    #[test]
+    fn apns_options_declare_alert_push_type_and_topic() {
+        let id = "7b1e9f6a-6e0f-4bb0-a7d1-555555555555";
+        let opts = apns_notification_options("com.scytheralpha.anonymail", id);
+        assert_eq!(opts.apns_push_type, Some(a2::PushType::Alert));
+        assert_eq!(opts.apns_topic, Some("com.scytheralpha.anonymail"));
+        assert_eq!(
+            opts.apns_collapse_id.as_ref().map(|c| c.value),
+            Some(id),
+            "collapse id groups retries of the same message"
+        );
     }
 }

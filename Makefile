@@ -19,6 +19,8 @@ help:
 	@echo "  make docker-login   Log in to ghcr.io (needs \$$GHCR_TOKEN; \$$GHCR_USER optional)"
 	@echo "  make publish        Build $(PLATFORMS) and push :$(VERSION) and :latest"
 	@echo "  make docker-build   Build a single-arch image locally (no push)"
+	@echo "  make up-build       Build from this checkout and restart (skip GHCR / Actions)"
+	@echo "  Dokploy:            Compose Path ./docker-compose.dokploy.yml (type: Docker Compose, not Stack)"
 	@echo "  make version        Print the version parsed from Cargo.toml"
 
 .PHONY: version
@@ -80,3 +82,9 @@ publish: buildx-init
 .PHONY: docker-build
 docker-build:
 	docker build --tag $(IMAGE):$(VERSION) --tag $(IMAGE):latest .
+
+# Compile this checkout on the host machine and recreate the app container.
+# Uses docker-compose.build.yml so compose never waits on GHCR / Actions.
+.PHONY: up-build
+up-build:
+	docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build

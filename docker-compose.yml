@@ -3,7 +3,10 @@ services:
     # Prebuilt multi-arch image published to GitHub Container Registry. Pull it
     # with `docker compose pull`; no local Rust build required. Override the tag
     # with e.g. `ANONY_MAIL_TAG=0.1.0 docker compose up -d`.
-    # To build from source instead, run `make docker-build` (see Makefile).
+    # To build this checkout instead of waiting on GHCR/Actions:
+    #   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+    #   make up-build
+    # Dokploy: Compose Type = Docker Compose, Compose Path = ./docker-compose.dokploy.yml
     image: ghcr.io/1mrnewton/anony-mail:${ANONY_MAIL_TAG:-latest}
     environment:
       # Each value reads from the host environment (or a .env file next to this

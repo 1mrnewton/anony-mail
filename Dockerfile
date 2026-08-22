@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1
 # ---- Build stage ----
 FROM rust:1-slim-bookworm AS builder
 
@@ -16,7 +17,14 @@ COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations
 COPY src ./src
 
-RUN cargo build --release --bin anony-mail
+# Cache cargo registry + target across builds so a source-only change does not
+# recompile the world. Copy the binary *out* of the cache mount — mounts are
+# not part of the image, so COPY --from=builder would otherwise miss it.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release --bin anony-mail \
+    && cp /app/target/release/anony-mail /anony-mail
 
 # ---- Runtime stage ----
 FROM debian:bookworm-slim AS runtime
@@ -42,7 +50,7 @@ RUN groupadd --system --gid 10001 anonymail \
     && mkdir -p /data \
     && chown anonymail:anonymail /data
 
-COPY --from=builder /app/target/release/anony-mail /usr/local/bin/anony-mail
+COPY --from=builder /anony-mail /usr/local/bin/anony-mail
 
 # SMTP (2525) and HTTP API (8080). SMTP defaults to a high port because a
 # non-root process cannot bind 25; publish it as `-p 25:2525` (see

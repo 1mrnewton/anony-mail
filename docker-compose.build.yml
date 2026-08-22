@@ -1,0 +1,11 @@
+# Local overlay: docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+# Dokploy cannot take two compose files — use docker-compose.dokploy.yml instead
+# (Compose Path: ./docker-compose.dokploy.yml).
+
+services:
+  app:
+    image: anony-mail:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: build

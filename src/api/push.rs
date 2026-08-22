@@ -11,6 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tracing::info;
 use uuid::Uuid;
 
 use super::auth::authorize_owner;
@@ -117,13 +118,20 @@ pub async fn subscribe(
         )
         .await
     {
-        Ok(sub) => Ok((
-            StatusCode::CREATED,
-            Json(SubscribeResponse {
-                id: sub.id,
-                kind: sub.kind,
-            }),
-        )),
+        Ok(sub) => {
+            info!(
+                address = %address,
+                kind = kind.as_str(),
+                "push subscription registered"
+            );
+            Ok((
+                StatusCode::CREATED,
+                Json(SubscribeResponse {
+                    id: sub.id,
+                    kind: sub.kind,
+                }),
+            ))
+        }
         Err(e) => match e.downcast_ref::<SubscriptionLimit>() {
             Some(limit) => Err(ApiError::TooManyRequests(limit.to_string())),
             None => Err(ApiError::Internal(e)),

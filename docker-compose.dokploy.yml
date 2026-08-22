@@ -1,0 +1,54 @@
+# Dokploy compose — builds this checkout on the server (no GHCR / Actions wait).
+#
+# In the Dokploy Compose service:
+#   Compose Type: Docker Compose  (not Stack — Stack cannot `build`)
+#   Compose Path: ./docker-compose.dokploy.yml
+#   Provider: Git, this repo, your branch
+#   Auto Deploy: on  (push → rebuild)
+#
+# Environment tab: paste the same keys as .env.example (DOMAINS, APNS_*, …).
+# Prefer APNS_KEY_BASE64 over APNS_KEY_PATH — Dokploy wipes the git checkout
+# each deploy, so a repo-relative key file would disappear.
+#
+# Domains tab: add your API host (e.g. api.anonymail.store)
+#   Service: app
+#   Container port: 8080
+#   HTTPS / Let's Encrypt: on
+# Dokploy injects Traefik labels + networking; do not add them here.
+#
+# SMTP: host port 25 is published so MX can deliver. Open 25/tcp on the VPS
+# firewall. Do not put SMTP behind Traefik HTTP.
+
+services:
+  app:
+    image: anony-mail:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    pull_policy: build
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-sqlite:///data/anony-mail.db}
+      DOMAINS: ${DOMAINS:-example.com}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME:-mail.example.com}
+      DEFAULT_TTL_SECONDS: ${DEFAULT_TTL_SECONDS:-3600}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
+      RUST_LOG: ${RUST_LOG:-info,anony_mail=debug}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-}
+      APNS_TEAM_ID: ${APNS_TEAM_ID:-}
+      APNS_KEY_ID: ${APNS_KEY_ID:-}
+      APNS_TOPIC: ${APNS_TOPIC:-}
+      APNS_KEY_BASE64: ${APNS_KEY_BASE64:-}
+      APNS_KEY_PATH: ${APNS_KEY_PATH:-}
+      APNS_SANDBOX: ${APNS_SANDBOX:-false}
+    volumes:
+      - maildata:/data
+    expose:
+      - "8080"
+    ports:
+      - "25:2525"
+
+volumes:
+  maildata:
