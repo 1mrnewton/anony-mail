@@ -4,6 +4,7 @@ pub mod client;
 pub mod custom_domains;
 pub mod docs;
 pub mod entitlements;
+pub mod legal;
 pub mod limits;
 pub mod messages;
 pub mod push;
@@ -200,6 +201,11 @@ where
     // scrape does not treat `/docs` and `/openapi.json` as product API paths.
     if config.api_docs_enabled {
         non_sse = non_sse.merge(docs::router());
+    }
+
+    // Legal pages (`/tos`, `/privacy`) for the hosted deployment only.
+    if config.legal_pages_enabled {
+        non_sse = non_sse.merge(legal::router());
     }
 
     // Requests on non-SSE routes must finish within a bounded time; the SSE

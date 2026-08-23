@@ -34,6 +34,9 @@ services:
       DEFAULT_TTL_SECONDS: ${DEFAULT_TTL_SECONDS:-3600}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
       RUST_LOG: ${RUST_LOG:-info,anony_mail=debug}
+      # Legal pages (/tos, /privacy) — enable on the hosted deployment so
+      # anonymail.store/tos and /privacy resolve (App Review checks them).
+      LEGAL_PAGES_ENABLED: ${LEGAL_PAGES_ENABLED:-false}
       VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
       VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
       VAPID_SUBJECT: ${VAPID_SUBJECT:-}

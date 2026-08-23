@@ -122,6 +122,10 @@ pub struct Config {
     /// Serve Scalar at `/docs` and the OpenAPI document at `/openapi.json`.
     /// On by default; set `API_DOCS_ENABLED=false` to disable both.
     pub api_docs_enabled: bool,
+    /// Serve the hosted service's legal pages at `/tos` and `/privacy`.
+    /// Off by default: the embedded text names the hosted operator, so
+    /// self-hosted instances should leave this disabled.
+    pub legal_pages_enabled: bool,
     /// Max concurrent SSE event streams server-wide (0 disables the cap).
     pub sse_max_concurrent: usize,
     /// Max concurrent SSE event streams per client IP (0 disables the cap).
@@ -245,6 +249,7 @@ impl Default for Config {
             api_request_timeout: Duration::from_secs(30),
             api_trust_proxy_headers: false,
             api_docs_enabled: true,
+            legal_pages_enabled: false,
             sse_max_concurrent: 512,
             sse_max_per_ip: 8,
             max_addresses_per_ip_per_day: 200,
@@ -386,6 +391,7 @@ impl Config {
         let api_trust_proxy_headers =
             parse_env("API_TRUST_PROXY_HEADERS", base.api_trust_proxy_headers)?;
         let api_docs_enabled = parse_env("API_DOCS_ENABLED", base.api_docs_enabled)?;
+        let legal_pages_enabled = parse_env("LEGAL_PAGES_ENABLED", base.legal_pages_enabled)?;
         let sse_max_concurrent = parse_env("SSE_MAX_CONCURRENT", base.sse_max_concurrent)?;
         let sse_max_per_ip = parse_env("SSE_MAX_PER_IP", base.sse_max_per_ip)?;
         let max_addresses_per_ip_per_day = parse_env(
@@ -571,6 +577,7 @@ impl Config {
             api_request_timeout,
             api_trust_proxy_headers,
             api_docs_enabled,
+            legal_pages_enabled,
             sse_max_concurrent,
             sse_max_per_ip,
             max_addresses_per_ip_per_day,
